@@ -47,7 +47,7 @@ ADMIN_IDS: List[int] = [OWNER_ID]
 if os.getenv('ADMIN_IDS'):
     ADMIN_IDS = [int(x) for x in os.getenv('ADMIN_IDS').split(',') if x.strip()]
 
-# Maximum number of performers per order — changed to 3 as requested
+# Maximum number of performers per order
 MAX_WORKERS_PER_ORDER = 3
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -69,7 +69,6 @@ def init_db() -> None:
     )
     ''')
 
-    # products includes photo TEXT (telegram file_id) for nice display
     cur.execute('''
     CREATE TABLE IF NOT EXISTS products (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,17 +162,15 @@ def format_performers_for_caption(order_id: int) -> str:
 def build_admin_keyboard_for_order(order_id: int, order_status: str) -> InlineKeyboardMarkup:
     """
     Build inline keyboard for admin-group order message.
-    - If order_status is not 'paid' -> show only confirm/reject for admins.
-    - If 'paid' -> show take/leave for performers.
+    - If order_status is 'paid' -> show performer take/leave.
+    - Otherwise -> admin confirm/reject.
     """
     if order_status == 'paid':
-        # performer buttons
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton('🟢 Беру', callback_data=f'take:{order_id}'),
              InlineKeyboardButton('🔴 Сняться', callback_data=f'leave:{order_id}')],
         ])
     else:
-        # before payment confirmed: admin confirm/reject
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton('✅ Подтвердить оплату', callback_data=f'confirm:{order_id}'),
              InlineKeyboardButton('❌ Отклонить', callback_data=f'reject:{order_id}')],
@@ -197,7 +194,6 @@ def build_caption_for_admin_message(order_id: int, buyer_tg: str, pubg_id: Optio
 
 # --- Special handler: ignore any messages in admin group (so bot doesn't reply to normal texts there) ---
 async def ignore_admin_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Do nothing: this prevents text/photo messages from being processed in admin chat.
     return
 
 
@@ -227,7 +223,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # If message comes from admin group, ignore it (we already added a dedicated ignore handler; this is extra guard)
+    # ignore admin group messages
     if update.effective_chat and update.effective_chat.id == ADMIN_CHAT_ID:
         return
 
@@ -236,7 +232,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     text = update.message.text.strip()
     user = update.effective_user
 
-    # First: if admin is in product add/edit flow, route to handler
+    # If admin is in product add/edit flow, route to handlers for text inputs
     if context.user_data.get('product_flow'):
         await handle_add_product_flow(update, context)
         return
@@ -268,15 +264,13 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # Admin panel buttons
     if text == '➕ Добавить товар' and is_admin_tg(user.id):
-        # start interactive add flow
         start_product_flow(context.user_data)
         await update.message.reply_text('Добавление товара — шаг 1/4.\nВведите название товара или нажмите /cancel для отмены.', reply_markup=CANCEL_BUTTON)
         return
 
     if text == '✏️ Редактировать товар' and is_admin_tg(user.id):
-        # start edit flow: ask product id
+        # start edit flow: ask product id (text flow)
         context.user_data['edit_flow'] = {'stage': 'select', 'product_id': None}
-        # list products with ids
         prods = db_execute('SELECT id, name, price FROM products ORDER BY id', fetch=True)
         if not prods:
             await update.message.reply_text('Нет товаров для редактирования.', reply_markup=ADMIN_PANEL_KB)
@@ -287,14 +281,12 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     if text == '🗑️ Удалить товар' and is_admin_tg(user.id):
-        # ask product id to delete
         prods = db_execute('SELECT id, name, price FROM products ORDER BY id', fetch=True)
         if not prods:
             await update.message.reply_text('Нет товаров для удаления.', reply_markup=ADMIN_PANEL_KB)
             return
         lines = [f'ID {pid}: {name} — {price}₽' for pid, name, price in prods]
         await update.message.reply_text('Отправьте ID товара для удаления:\n\n' + '\n'.join(lines), reply_markup=CANCEL_BUTTON)
-        # set a short-lived flag to expect next text as delete id
         context.user_data['awaiting_delete_id'] = True
         return
 
@@ -302,7 +294,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await list_orders_admin(update, context)
         return
 
-    # If user sends PUBG ID free text (heuristic)
+    # Heuristic: user sending PUBG ID
     if text and len(text) <= 32 and ' ' not in text and text != '/start':
         db_execute('INSERT OR IGNORE INTO users (tg_id, username, registered_at) VALUES (?, ?, ?)',
                    (user.id, user.username or '', now_iso()))
@@ -385,10 +377,11 @@ async def handle_add_product_flow(update: Update, context: ContextTypes.DEFAULT_
         desc = (msg.text or '').strip()
         flow['data']['description'] = desc
         flow['stage'] = 'photo'
-        await msg.reply_text('Шаг 4/4. Отправьте фото товара (в ответном сообщении).', reply_markup=CANCEL_BUTTON)
+        await msg.reply_text('Шаг 4/4. Отправьте фото товара (как фото).', reply_markup=CANCEL_BUTTON)
         return
 
     if stage == 'photo':
+        # This function can be triggered by photo_router when admin sends photo
         if not msg.photo:
             await msg.reply_text('Пожалуйста, отправьте изображение (как фото).')
             return
@@ -410,7 +403,7 @@ async def handle_edit_product_flow(update: Update, context: ContextTypes.DEFAULT
     """
     edit_flow stages:
       - select : expecting product id (text)
-      - choose_field : we show inline buttons (name, price, desc, photo)
+      - choose_field : present inline buttons (handled via callback)
       - editing_name / editing_price / editing_desc / editing_photo : awaiting input
     """
     msg = update.message
@@ -431,7 +424,7 @@ async def handle_edit_product_flow(update: Update, context: ContextTypes.DEFAULT
         return
 
     if stage == 'select':
-        # expect product id
+        # expect product id (text path)
         try:
             pid = int((msg.text or '').strip())
         except Exception:
@@ -455,7 +448,7 @@ async def handle_edit_product_flow(update: Update, context: ContextTypes.DEFAULT
         await msg.reply_text(f'Выбран товар #{pid}. Выберите поле для редактирования.', reply_markup=kb)
         return
 
-    # following stages editing_* are set via callback handlers; here we only catch input when awaiting
+    # handle awaited text/photo for editing fields
     if stage in ('editing_name', 'editing_price', 'editing_desc'):
         pid = flow.get('product_id')
         if pid is None:
@@ -487,7 +480,7 @@ async def handle_edit_product_flow(update: Update, context: ContextTypes.DEFAULT
         return
 
     if stage == 'editing_photo':
-        # expect photo
+        # expect photo (this will be routed from photo_router)
         if not msg.photo:
             await msg.reply_text('Пожалуйста, отправьте фото (в виде фото).')
             return
@@ -589,9 +582,51 @@ async def delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         pass
 
 
-# --- Products display and buy flows (unchanged) ---
+# New: callback to start edit flow (from product detail)
+async def edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if q is None:
+        return
+    await q.answer()
+    data = q.data or ''
+    if not data.startswith('edit:'):
+        return
+    _, pid_str = data.split(':', 1)
+    try:
+        pid = int(pid_str)
+    except ValueError:
+        await q.edit_message_text('Неверный product id.')
+        return
+    user = q.from_user
+    if not is_admin_tg(user.id):
+        await q.answer(text='Только админы.', show_alert=True)
+        return
+
+    row = db_execute('SELECT id, name, price FROM products WHERE id=?', (pid,), fetch=True)
+    if not row:
+        try:
+            await q.edit_message_text('Товар не найден.')
+        except Exception:
+            pass
+        return
+
+    # set edit_flow and show inline choose-field keyboard
+    context.user_data['edit_flow'] = {'stage': 'choose_field', 'product_id': pid}
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton('Название', callback_data=f'editfield:name:{pid}'),
+         InlineKeyboardButton('Цена', callback_data=f'editfield:price:{pid}')],
+        [InlineKeyboardButton('Описание', callback_data=f'editfield:desc:{pid}'),
+         InlineKeyboardButton('Фото', callback_data=f'editfield:photo:{pid}')],
+        [InlineKeyboardButton('Отмена', callback_data=f'editfield:cancel:{pid}')]
+    ])
+    try:
+        await q.message.reply_text(f'Редактирование товара #{pid}. Выберите поле для редактирования.', reply_markup=kb)
+    except Exception:
+        pass
+
+
+# --- Products display and buy flows ---
 async def products_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Query all products with photo column
     products = db_execute('SELECT id, name, description, price, photo FROM products ORDER BY id', fetch=True)
     if not products:
         await update.message.reply_text('Каталог пуст. Админ может добавить товары.', reply_markup=MAIN_MENU)
@@ -603,10 +638,8 @@ async def products_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             [InlineKeyboardButton(text=f'Купить — {price}₽', callback_data=f'buy:{pid}'),
              InlineKeyboardButton(text='ℹ️ Подробнее', callback_data=f'detail:{pid}')]
         ])
-
         try:
             if photo:
-                # photo is expected to be Telegram file_id
                 if update.message:
                     await update.message.reply_photo(photo=photo, caption=caption, reply_markup=kb, parse_mode='Markdown')
                 else:
@@ -617,7 +650,6 @@ async def products_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 else:
                     await context.bot.send_message(chat_id=update.effective_chat.id, text=caption, reply_markup=kb)
         except Exception:
-            # fallback to text-only
             try:
                 await context.bot.send_message(chat_id=update.effective_chat.id, text=caption, reply_markup=kb)
             except Exception:
@@ -630,6 +662,8 @@ async def products_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 # Product details callback
 async def product_detail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    if q is None:
+        return
     await q.answer()
     data = q.data or ''
     if not data.startswith('detail:'):
@@ -641,7 +675,10 @@ async def product_detail_callback(update: Update, context: ContextTypes.DEFAULT_
         return
     row = db_execute('SELECT name, description, price, photo FROM products WHERE id=?', (pid,), fetch=True)
     if not row:
-        await q.edit_message_text('Товар не найден.')
+        try:
+            await q.edit_message_text('Товар не найден.')
+        except Exception:
+            pass
         return
     name, desc, price, photo = row[0]
     caption = f"*{name}*\n\n{desc or ''}\n\n💰 Цена: *{price}₽*"
@@ -679,7 +716,6 @@ async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     lines = []
     for oid, pname, price, status in rows:
-        # show performers too
         perf_rows = db_execute('SELECT worker_username FROM order_workers WHERE order_id=? ORDER BY id', (oid,), fetch=True)
         perflist = ', '.join([r[0] or str(r[0]) for r in perf_rows]) if perf_rows else '-'
         lines.append(f'#{oid} {pname} — {price}₽ — {status} — Исполнители: {perflist}')
@@ -735,8 +771,39 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         pass
 
 
-# Photo (payment screenshot) handler: send order to admin group (with confirm/reject buttons)
-async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+# --- Photo routing: either admin product-photo flows OR payment screenshots ---
+async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Route incoming photos:
+    - If the user is an admin and is in product_flow or edit_flow expecting a photo -> forward to those handlers.
+    - Otherwise treat as payment screenshot.
+    """
+    msg = update.message
+    if msg is None:
+        return
+    user = msg.from_user
+    if user is None:
+        return
+
+    # If admin is adding a product and expecting photo -> handle there
+    if is_admin_tg(user.id) and context.user_data.get('product_flow'):
+        flow = context.user_data.get('product_flow', {})
+        if flow.get('stage') == 'photo':
+            await handle_add_product_flow(update, context)
+            return
+
+    # If admin is editing and expecting photo -> handle edit flow
+    if is_admin_tg(user.id) and context.user_data.get('edit_flow'):
+        flow = context.user_data.get('edit_flow', {})
+        if flow.get('stage') == 'editing_photo':
+            await handle_edit_product_flow(update, context)
+            return
+
+    # Otherwise treat photo as payment screenshot
+    await payment_photo_handler(update, context)
+
+
+async def payment_photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # ignore if in admin chat (prevents users spamming there)
     if update.effective_chat and update.effective_chat.id == ADMIN_CHAT_ID:
         return
@@ -778,9 +845,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     # Send to admin group. If bot not in group -> log and notify owner
     try:
-        # send first to admin group only
         await context.bot.send_photo(chat_id=ADMIN_CHAT_ID, photo=file_id, caption=caption, reply_markup=kb)
-        # optionally also notify other chats configured in NOTIFY_CHAT_IDS (no buttons there)
         for nid in NOTIFY_CHAT_IDS:
             try:
                 await context.bot.send_message(chat_id=nid, text=f'Новый заказ #{order_id} ожидает проверки. Проверьте в админ-группе.')
@@ -789,7 +854,6 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await message.reply_text('Скриншот отправлен админам для проверки. Ожидайте подтверждения.', reply_markup=MAIN_MENU)
     except Exception as e:
         logger.exception('Failed to send to admin group: %s', e)
-        # notify owner
         try:
             await context.bot.send_message(chat_id=OWNER_ID, text=f'Не удалось отправить заказ #{order_id} в админ-группу. Ошибка: {e}')
         except Exception:
@@ -817,10 +881,8 @@ async def admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     user = query.from_user
-    # Only admins can confirm/reject
     if not is_admin_tg(user.id):
         try:
-            # Inform non-admins that they are not allowed to press this button
             await query.answer(text='Только админы могут подтверждать/отклонять оплату.', show_alert=True)
         except Exception:
             pass
@@ -846,26 +908,20 @@ async def admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     product_name = db_execute('SELECT name FROM products WHERE id=?', (product_id,), fetch=True)[0][0]
 
     if action == 'confirm':
-        # mark paid
         db_execute('UPDATE orders SET status=?, admin_notes=? WHERE id=?', ('paid', f'Оплачен и подтверждён админом {user.id}', order_id))
-        # update message in admin group: replace keyboard with performer keyboard
         caption = build_caption_for_admin_message(order_id, buyer_tg, pubg_id, product_name, price, created_at, 'paid')
         kb = build_admin_keyboard_for_order(order_id, 'paid')
         try:
-            # try to edit original message (the one with screenshot)
             await query.edit_message_caption(caption, reply_markup=kb)
         except Exception:
-            # fallback: send new message with performer keyboard
             try:
                 await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=caption, reply_markup=kb)
             except Exception:
                 logger.exception('Failed to update admin message after confirm')
-        # notify buyer
         try:
             await context.bot.send_message(chat_id=buyer_row[0][0], text=(f'Ваш заказ #{order_id} на \"{product_name}\" оплачен и подтверждён. Ожидайте исполнителей.'))
         except Exception:
             logger.warning('Failed to notify buyer')
-        # notify notifies
         for nid in NOTIFY_CHAT_IDS:
             try:
                 await context.bot.send_message(chat_id=nid, text=f'Заказ #{order_id} подтверждён. Ожидаем исполнителей.')
@@ -883,7 +939,6 @@ async def admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             except Exception:
                 pass
         try:
-            # notify buyer
             await context.bot.send_message(chat_id=buyer_row[0][0], text=(f'Ваш заказ #{order_id} был отклонён администратором. Пожалуйста, свяжитесь с поддержкой.'))
         except Exception:
             logger.warning('Failed to notify buyer')
@@ -912,7 +967,6 @@ async def performer_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     worker_id = user.id
     worker_username = user.username or f'{user.first_name} {user.last_name or ""}'.strip()
 
-    # Check order exists and is paid
     order_row = db_execute('SELECT status, product_id, price, created_at FROM orders WHERE id=?', (order_id,), fetch=True)
     if not order_row:
         try:
@@ -928,7 +982,6 @@ async def performer_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             pass
         return
 
-    # Fetch current performers
     current = db_execute('SELECT worker_id FROM order_workers WHERE order_id=?', (order_id,), fetch=True) or []
     current_ids = [r[0] for r in current]
 
@@ -945,7 +998,6 @@ async def performer_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             except Exception:
                 pass
             return
-        # add performer
         db_execute('INSERT INTO order_workers (order_id, worker_id, worker_username, taken_at) VALUES (?, ?, ?, ?)',
                    (order_id, worker_id, worker_username, now_iso()))
         try:
@@ -966,7 +1018,6 @@ async def performer_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         except Exception:
             pass
 
-    # Update caption in admin group to show new performers
     buyer_row = db_execute('SELECT u.tg_id, u.username, u.pubg_id, p.name FROM orders o JOIN users u ON o.user_id=u.id JOIN products p ON o.product_id=p.id WHERE o.id=?', (order_id,), fetch=True)
     if buyer_row:
         buyer_tg_id, buyer_username, pubg_id, product_name = buyer_row[0]
@@ -978,11 +1029,9 @@ async def performer_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     caption = build_caption_for_admin_message(order_id, buyer_tg, pubg_id, product_name, price, created_at, 'paid')
     kb = build_admin_keyboard_for_order(order_id, 'paid')
 
-    # Try to edit the message that triggered callback; if fails, send updated message to admin group
     try:
         await query.edit_message_caption(caption, reply_markup=kb)
     except Exception:
-        # fallback: send updated message to group
         try:
             await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=caption, reply_markup=kb)
         except Exception:
@@ -1001,8 +1050,7 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def add_product_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # This handler accepts the old 'price|name|desc' style if you prefer to use it in chat;
-    # but main admin addition remains the interactive flow.
+    # legacy 'price|name|desc' format
     if update.message is None:
         return
     user = update.effective_user
@@ -1038,31 +1086,24 @@ async def list_orders_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     text_lines = []
     for r in rows:
         oid, tg_id, pubg_id, pname, price, status, created = r
-        # performers for each order
         perf_rows = db_execute('SELECT worker_username FROM order_workers WHERE order_id=? ORDER BY id', (oid,), fetch=True)
         perflist = ', '.join([pr[0] or str(pr[0]) for pr in perf_rows]) if perf_rows else '-'
         text_lines.append(f'#{oid} {pname} {price}₽ {status} tg:{tg_id} pubg:{pubg_id or "-"} — Исполнители: {perflist} — {created}')
-    # send in chunks if too big
     big = '\n'.join(text_lines)
     if len(big) <= 4000:
         await update.message.reply_text(big, reply_markup=MAIN_MENU)
     else:
-        # split
         parts = [big[i:i+3500] for i in range(0, len(big), 3500)]
         for p in parts:
             await update.message.reply_text(p)
         await update.message.reply_text('Конец списка.', reply_markup=MAIN_MENU)
 
 
-# New admin helper: set photo for product (kept for backwards compatibility)
-# Usage: reply to a photo with message "/setphoto <product_id>"
+# New admin helper: set photo for product (reply to photo with /setphoto <id>)
 async def setphoto_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # must be admin
     user = update.effective_user
     if not is_admin_tg(user.id):
         return
-
-    # this handler must be a command in reply to a photo message
     msg = update.message
     if msg is None:
         return
@@ -1080,7 +1121,6 @@ async def setphoto_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await msg.reply_text('Неверный product_id')
         return
 
-    # get file_id from the replied photo
     photo = msg.reply_to_message.photo[-1]
     file_id = photo.file_id
 
@@ -1088,7 +1128,7 @@ async def setphoto_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await msg.reply_text(f'Фото установлено для товара {pid}', reply_markup=ADMIN_PANEL_KB)
 
 
-# Command /add <name> <price> <description> (admin only) - kept for convenience
+# Command /add <name> <price> <description> (admin only)
 async def add_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if not is_admin_tg(user.id):
@@ -1128,9 +1168,13 @@ def build_app():
     # user flows
     app.add_handler(CommandHandler('start', start), group=1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router), group=1)
+
+    # photo router (routes admin product photos -> product flows, else -> payment handler)
+    app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, photo_router), group=1)
+
+    # callbacks for product browsing / buy
     app.add_handler(CallbackQueryHandler(buy_callback, pattern=r'^buy:'), group=1)
     app.add_handler(CallbackQueryHandler(product_detail_callback, pattern=r'^detail:'), group=1)
-    app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, photo_handler), group=1)
 
     # admin / performer callbacks
     app.add_handler(CallbackQueryHandler(admin_decision, pattern=r'^(confirm:|reject:)'), group=2)
@@ -1139,12 +1183,13 @@ def build_app():
     # product edit/delete callbacks
     app.add_handler(CallbackQueryHandler(editfield_callback, pattern=r'^editfield:'), group=2)
     app.add_handler(CallbackQueryHandler(delete_callback, pattern=r'^delete:'), group=2)
-    app.add_handler(CallbackQueryHandler(product_detail_callback, pattern=r'^edit:'), group=2)  # open detail with edit/delete
+    app.add_handler(CallbackQueryHandler(edit_callback, pattern=r'^edit:'), group=2)  # opens edit flow from detail
 
-    # admin flows
+    # admin flows / commands
     app.add_handler(CommandHandler('admin', admin_menu), group=1)
     app.add_handler(CommandHandler('add', add_command_handler), group=1)
     app.add_handler(CommandHandler('setphoto', setphoto_handler), group=1)
+    # legacy quick-add (kept)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_text_handler), group=1)
 
     app.add_error_handler(error_handler)
