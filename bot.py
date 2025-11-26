@@ -764,7 +764,7 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         await query.message.reply_text(
             f'Вы выбрали: {name} — {price}₽\n\n'
-            'Отправьте скриншот оплаты (перевод/квитанция) в этот чат.\n'
+            'Оплатите товар по номеру телефона 89002535363(сбер Николай М) и Отправьте скриншот оплаты (перевод/квитанция) в этот чат.\n'
             'Если вы не указали PUBG ID — добавьте его в сообщении.'
         )
     except Exception:
