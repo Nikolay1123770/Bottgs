@@ -37,7 +37,7 @@ from telegram.ext import (
 from telegram.error import BadRequest
 
 # --- Configuration ---
-TG_BOT_TOKEN = os.getenv('TG_BOT_TOKEN', '8269807126:AAGnM0QssM3NganDmQXHftxfu9itaOujvWA')
+TG_BOT_TOKEN = os.getenv('TG_BOT_TOKEN', '8269807126:AAGzhIZDSbTWUpoWsrDxaS7Fm4W_D3YadIo')
 OWNER_ID = int(os.getenv('OWNER_ID', '8473513085'))
 ADMIN_CHAT_ID = int(os.getenv('ADMIN_CHAT_ID', '-1003448809517'))
 NOTIFY_CHAT_IDS = [int(x) for x in os.getenv('NOTIFY_CHAT_IDS', '-1003448809517').split(',') if x.strip()]
