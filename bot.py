@@ -404,7 +404,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     if text == '📞 Поддержка':
         bot_username = context.bot.username or 'админ'
-        await update.message.reply_text('Свяжитесь с владельцем: @zavik911' + bot_username, reply_markup=MAIN_MENU)
+        await update.message.reply_text('Свяжитесь с владельцем: @zavik911' , reply_markup=MAIN_MENU)
         return
     if text == '↩️ Назад':
         await update.message.reply_text('Вернулись в меню.', reply_markup=MAIN_MENU)
