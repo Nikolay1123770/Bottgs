@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Metro Shop Telegram Bot (bot.py)
-Features:
-- Button-based menu
-- User registration (PUBG ID)
-- Browse shop and buy products with payment screenshot
-- Admin panel: confirm/reject payments (only admins)
-- Performer flow: after payment confirmation performers press "Беру"/"Сняться"
-- Up to MAX_WORKERS_PER_ORDER performers per order
+Metro Shop Telegram Bot (enhanced bot.py)
+Added features:
+- Performer stats (/worker)
+- Order progress statuses: in_progress, delivering, done
+- Reviews per worker
+- Product preview card with rating & completed count
+- Worker payouts calculation & recording (worker_payouts)
+- Support for multiple product photos (product_photos)
 Requires: python-telegram-bot v20+
 """
 
@@ -24,6 +24,7 @@ from telegram import (
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
     KeyboardButton,
+    InputMediaPhoto,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -48,7 +49,10 @@ if os.getenv('ADMIN_IDS'):
     ADMIN_IDS = [int(x) for x in os.getenv('ADMIN_IDS').split(',') if x.strip()]
 
 # Maximum number of performers per order
-MAX_WORKERS_PER_ORDER = 3
+MAX_WORKERS_PER_ORDER = int(os.getenv('MAX_WORKERS_PER_ORDER', '3'))
+
+# Percent to pay to workers (0.0 - 1.0). Will be split equally across workers assigned.
+WORKER_PERCENT = float(os.getenv('WORKER_PERCENT', '0.7'))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -56,9 +60,11 @@ logger = logging.getLogger(__name__)
 
 # --- DB helpers ---
 def init_db() -> None:
-    """Create tables. products now has `photo` column that stores Telegram file_id (TEXT)."""
+    """Create tables and new columns. Use safe ALTERs where possible."""
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
+
+    # Base tables (existing)
     cur.execute('''
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY,
@@ -80,6 +86,16 @@ def init_db() -> None:
     )
     ''')
 
+    # product_photos: optional multiple photos per product (file_id)
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS product_photos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER,
+        file_id TEXT,
+        created_at TEXT
+    )
+    ''')
+
     cur.execute('''
     CREATE TABLE IF NOT EXISTS orders (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,6 +110,16 @@ def init_db() -> None:
     )
     ''')
 
+    # add columns to orders if not exists: started_at, done_at
+    try:
+        cur.execute("ALTER TABLE orders ADD COLUMN started_at TEXT")
+    except Exception:
+        pass
+    try:
+        cur.execute("ALTER TABLE orders ADD COLUMN done_at TEXT")
+    except Exception:
+        pass
+
     cur.execute('''
     CREATE TABLE IF NOT EXISTS order_workers (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -101,6 +127,30 @@ def init_db() -> None:
         worker_id INTEGER,
         worker_username TEXT,
         taken_at TEXT
+    )
+    ''')
+
+    # reviews per worker (rating + text)
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS reviews (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id INTEGER,
+        buyer_id INTEGER,
+        worker_id INTEGER,
+        rating INTEGER,
+        text TEXT,
+        created_at TEXT
+    )
+    ''')
+
+    # worker payouts record
+    cur.execute('''
+    CREATE TABLE IF NOT EXISTS worker_payouts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id INTEGER,
+        worker_id INTEGER,
+        amount REAL,
+        created_at TEXT
     )
     ''')
 
@@ -162,23 +212,35 @@ def format_performers_for_caption(order_id: int) -> str:
 def build_admin_keyboard_for_order(order_id: int, order_status: str) -> InlineKeyboardMarkup:
     """
     Build inline keyboard for admin-group order message.
-    - If order_status is 'paid' -> show performer take/leave.
-    - Otherwise -> admin confirm/reject.
+    - If status pending_verification -> admin confirm/reject.
+    - If paid or in progress -> show performer take/leave + status change buttons.
+    - If rejected/done -> only info.
     """
-    if order_status == 'paid':
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton('🟢 Беру', callback_data=f'take:{order_id}'),
-             InlineKeyboardButton('🔴 Сняться', callback_data=f'leave:{order_id}')],
-        ])
-    else:
+    if order_status == 'pending_verification' or order_status == 'awaiting_screenshot':
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton('✅ Подтвердить оплату', callback_data=f'confirm:{order_id}'),
              InlineKeyboardButton('❌ Отклонить', callback_data=f'reject:{order_id}')],
         ])
+    elif order_status in ('paid', 'in_progress', 'delivering'):
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton('🟢 Беру', callback_data=f'take:{order_id}'),
+             InlineKeyboardButton('🔴 Сняться', callback_data=f'leave:{order_id}')],
+            [InlineKeyboardButton('▶ Начать', callback_data=f'status:{order_id}:in_progress'),
+             InlineKeyboardButton('📦 На выдаче', callback_data=f'status:{order_id}:delivering'),
+             InlineKeyboardButton('🏁 Выполнено', callback_data=f'status:{order_id}:done')],
+        ])
+    elif order_status == 'done':
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton('ℹ️ Просмотреть', callback_data=f'detail_order:{order_id}')],
+        ])
+    else:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton('ℹ️ Просмотреть', callback_data=f'detail_order:{order_id}')],
+        ])
     return kb
 
 
-def build_caption_for_admin_message(order_id: int, buyer_tg: str, pubg_id: Optional[str], product: str, price: float, created_at: str, status: str) -> str:
+def build_caption_for_admin_message(order_id: int, buyer_tg: str, pubg_id: Optional[str], product: str, price: float, created_at: str, status: str, started_at: Optional[str] = None, done_at: Optional[str] = None) -> str:
     base_lines = [
         f'📦 Заказ #{order_id}',
         f'Пользователь: {buyer_tg}',
@@ -187,8 +249,12 @@ def build_caption_for_admin_message(order_id: int, buyer_tg: str, pubg_id: Optio
         f'Сумма: {price}₽',
         f'Статус: {status}',
         f'Время: {created_at}',
-        format_performers_for_caption(order_id),
     ]
+    if started_at:
+        base_lines.append(f'Начат: {started_at}')
+    if done_at:
+        base_lines.append(f'Выполнен: {done_at}')
+    base_lines.append(format_performers_for_caption(order_id))
     return '\n'.join(base_lines)
 
 
@@ -222,6 +288,83 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(text, reply_markup=MAIN_MENU)
 
 
+# --- Review flow handler (text-based parts) ---
+async def handle_review_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Flow states stored in context.user_data['review_flow']:
+     - stage: 'awaiting_rating' / 'awaiting_text'
+     - order_id
+     - worker_id
+     - temp_rating
+     - done_workers -> list of worker_ids already reviewed in this flow
+    """
+    msg = update.message
+    if msg is None:
+        return
+    user = update.effective_user
+    flow = context.user_data.get('review_flow')
+    if not flow:
+        return
+
+    # cancel
+    if msg.text and msg.text.strip().lower() in ['/cancel', '↩️ назад']:
+        context.user_data.pop('review_flow', None)
+        await msg.reply_text('Оставление отзыва отменено.', reply_markup=MAIN_MENU)
+        return
+
+    stage = flow.get('stage')
+    if stage == 'awaiting_rating':
+        text = (msg.text or '').strip()
+        try:
+            rating = int(text)
+            if rating < 1 or rating > 5:
+                raise ValueError()
+        except Exception:
+            await msg.reply_text('Неверный рейтинг. Отправьте число от 1 до 5.')
+            return
+        flow['temp_rating'] = rating
+        flow['stage'] = 'awaiting_text'
+        await msg.reply_text('Опционально: напишите текст отзыва или отправьте "Пропустить".', reply_markup=CANCEL_BUTTON)
+        return
+
+    if stage == 'awaiting_text':
+        text = (msg.text or '').strip()
+        text_value = ''
+        if text.lower() not in ('пропустить', 'skip', ''):
+            text_value = text
+        order_id = flow['order_id']
+        worker_id = flow['worker_id']
+        buyer_row = db_execute('SELECT id FROM users WHERE tg_id=?', (user.id,), fetch=True)
+        buyer_id = buyer_row[0][0] if buyer_row else None
+        db_execute('INSERT INTO reviews (order_id, buyer_id, worker_id, rating, text, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+                   (order_id, buyer_id, worker_id, flow.get('temp_rating'), text_value, now_iso()))
+        # mark done
+        done_workers = flow.get('done_workers', [])
+        done_workers.append(worker_id)
+        flow['done_workers'] = done_workers
+        # check if there are remaining workers to review (from order_workers)
+        remaining = db_execute('SELECT worker_id, worker_username FROM order_workers WHERE order_id=? AND worker_id NOT IN ({seq})'.format(
+            seq=','.join(['?'] * (len(done_workers))) if done_workers else '0'
+        ), tuple([order_id] + done_workers), fetch=True) if done_workers else db_execute('SELECT worker_id, worker_username FROM order_workers WHERE order_id=?', (order_id,), fetch=True)
+
+        # The above SQL is a bit awkward; do a simpler approach: fetch all workers, then filter in Python.
+        all_ws = db_execute('SELECT worker_id, worker_username FROM order_workers WHERE order_id=? ORDER BY id', (order_id,), fetch=True)
+        remaining_workers = [w for w in all_ws if w[0] not in done_workers]
+
+        if remaining_workers:
+            # ask for next worker
+            next_worker = remaining_workers[0]
+            flow['worker_id'] = next_worker[0]
+            flow['stage'] = 'awaiting_rating'
+            await msg.reply_text(f'Оцените исполнителя @{next_worker[1]} (1-5)', reply_markup=CANCEL_BUTTON)
+            return
+        else:
+            # done with all reviews in this flow
+            context.user_data.pop('review_flow', None)
+            await msg.reply_text('Спасибо за отзывы! Они помогут другим пользователям и исполнителям.', reply_markup=MAIN_MENU)
+            return
+
+
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # ignore admin group messages
     if update.effective_chat and update.effective_chat.id == ADMIN_CHAT_ID:
@@ -231,6 +374,11 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     text = update.message.text.strip()
     user = update.effective_user
+
+    # If review flow active, handle it first
+    if context.user_data.get('review_flow'):
+        await handle_review_flow(update, context)
+        return
 
     # If admin is in product add/edit flow, route to handlers for text inputs
     if context.user_data.get('product_flow'):
@@ -256,7 +404,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     if text == '📞 Поддержка':
         bot_username = context.bot.username or 'админ'
-        await update.message.reply_text('Свяжитесь с владельцем: @' + bot_username, reply_markup=MAIN_MENU)
+        await update.message.reply_text('Свяжитесь с владельцем: @zavik911' + bot_username, reply_markup=MAIN_MENU)
         return
     if text == '↩️ Назад':
         await update.message.reply_text('Вернулись в меню.', reply_markup=MAIN_MENU)
@@ -327,7 +475,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 # --- Add product interactive flow ---
 async def handle_add_product_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles per-step interactive product addition: name -> price -> desc -> photo"""
+    """Handles per-step interactive product addition: name -> price -> desc -> photo (and optional extra photos)"""
     msg = update.message
     if msg is None:
         return
@@ -356,7 +504,7 @@ async def handle_add_product_flow(update: Update, context: ContextTypes.DEFAULT_
             return
         flow['data']['name'] = name
         flow['stage'] = 'price'
-        await msg.reply_text('Шаг 2/4. Введите цену (числом), например: 300', reply_markup=CANCEL_BUTTON)
+        await msg.reply_text('Шаг 2/5. Введите цену (числом), например: 300', reply_markup=CANCEL_BUTTON)
         return
 
     if stage == 'price':
@@ -370,14 +518,14 @@ async def handle_add_product_flow(update: Update, context: ContextTypes.DEFAULT_
             return
         flow['data']['price'] = price
         flow['stage'] = 'desc'
-        await msg.reply_text('Шаг 3/4. Введите описание товара (короткое).', reply_markup=CANCEL_BUTTON)
+        await msg.reply_text('Шаг 3/5. Введите описание товара (короткое).', reply_markup=CANCEL_BUTTON)
         return
 
     if stage == 'desc':
         desc = (msg.text or '').strip()
         flow['data']['description'] = desc
         flow['stage'] = 'photo'
-        await msg.reply_text('Шаг 4/4. Отправьте фото товара (как фото).', reply_markup=CANCEL_BUTTON)
+        await msg.reply_text('Шаг 4/5. Отправьте главное фото товара (как фото).', reply_markup=CANCEL_BUTTON)
         return
 
     if stage == 'photo':
@@ -393,9 +541,31 @@ async def handle_add_product_flow(update: Update, context: ContextTypes.DEFAULT_
         created = now_iso()
         db_execute('INSERT INTO products (name, description, price, photo, created_at) VALUES (?, ?, ?, ?, ?)',
                    (name, desc, price, photo, created))
-        clear_product_flow(context.user_data)
-        await msg.reply_text(f'Товар добавлен: {name} — {price}₽', reply_markup=ADMIN_PANEL_KB)
+        # get product id
+        row = db_execute('SELECT id FROM products WHERE created_at=? ORDER BY id DESC LIMIT 1', (created,), fetch=True)
+        pid = row[0][0] if row else None
+        flow['data']['product_id'] = pid
+        flow['stage'] = 'extra_photos'
+        await msg.reply_text('Шаг 5/5 (опционально). Отправьте дополнительные фото по одному или нажмите ↩️ Назад, чтобы завершить.', reply_markup=CANCEL_BUTTON)
         return
+
+    if stage == 'extra_photos':
+        # accept photo and add to product_photos
+        if msg.photo:
+            photo = msg.photo[-1].file_id
+            pid = flow['data'].get('product_id')
+            if not pid:
+                await msg.reply_text('Ошибка: не найден product_id.', reply_markup=ADMIN_PANEL_KB)
+                clear_product_flow(context.user_data)
+                return
+            db_execute('INSERT INTO product_photos (product_id, file_id, created_at) VALUES (?, ?, ?)', (pid, photo, now_iso()))
+            await msg.reply_text('Фото добавлено. Отправьте ещё фото или нажмите ↩️ Назад, чтобы завершить.', reply_markup=CANCEL_BUTTON)
+            return
+        else:
+            # treat as finish if user pressed back or text
+            clear_product_flow(context.user_data)
+            await msg.reply_text(f'Товар добавлен: {flow["data"].get("name")} — {flow["data"].get("price")}₽', reply_markup=ADMIN_PANEL_KB)
+            return
 
 
 # --- Edit product interactive flow ---
@@ -626,6 +796,20 @@ async def edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # --- Products display and buy flows ---
+def _get_product_rating_and_count(pid: int):
+    """Compute average rating across reviews for workers on orders of this product and number of completed orders."""
+    # average rating: all reviews for orders where product_id == pid
+    rows = db_execute('SELECT r.rating FROM reviews r JOIN orders o ON r.order_id=o.id WHERE o.product_id=?', (pid,), fetch=True)
+    if not rows:
+        avg = None
+    else:
+        vals = [r[0] for r in rows if r[0] is not None]
+        avg = (sum(vals) / len(vals)) if vals else None
+    completed_count_row = db_execute('SELECT COUNT(*) FROM orders WHERE product_id=? AND status=?', (pid, 'done'), fetch=True)
+    completed_count = completed_count_row[0][0] if completed_count_row else 0
+    return avg, completed_count
+
+
 async def products_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     products = db_execute('SELECT id, name, description, price, photo FROM products ORDER BY id', fetch=True)
     if not products:
@@ -633,7 +817,9 @@ async def products_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     for pid, name, desc, price, photo in products:
-        caption = f"🛒 *{name}*\n{desc or ''}\n\n💰 Цена: *{price}₽*"
+        avg, completed_count = _get_product_rating_and_count(pid)
+        rating_line = f"⭐ {avg:.1f} (отзывы)" if avg is not None else "—"
+        caption = f"🛒 *{name}*\n{desc or ''}\n\n💰 Цена: *{price}₽*\n{rating_line} • Выполнено: {completed_count}"
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton(text=f'Купить — {price}₽', callback_data=f'buy:{pid}'),
              InlineKeyboardButton(text='ℹ️ Подробнее', callback_data=f'detail:{pid}')]
@@ -681,15 +867,43 @@ async def product_detail_callback(update: Update, context: ContextTypes.DEFAULT_
             pass
         return
     name, desc, price, photo = row[0]
-    caption = f"*{name}*\n\n{desc or ''}\n\n💰 Цена: *{price}₽*"
+    avg, completed_count = _get_product_rating_and_count(pid)
+    rating_line = f"⭐ {avg:.1f} (по отзывам)" if avg is not None else "Нет оценок"
+    caption = f"*{name}*\n\n{desc or ''}\n\n💰 Цена: *{price}₽*\n{rating_line} • Выполнено: {completed_count}"
+
+    # fetch extra photos
+    photos = db_execute('SELECT file_id FROM product_photos WHERE product_id=? ORDER BY id', (pid,), fetch=True) or []
+    file_ids = [p[0] for p in photos]
+    # include main photo as first if exists
+    if photo:
+        if not file_ids or file_ids[0] != photo:
+            media = [photo] + file_ids
+        else:
+            media = file_ids
+    else:
+        media = file_ids
+
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(text=f'Купить — {price}₽', callback_data=f'buy:{pid}'),
          InlineKeyboardButton(text='Редактировать', callback_data=f'edit:{pid}'),
          InlineKeyboardButton(text='Удалить', callback_data=f'delete:{pid}')]
     ])
     try:
-        if photo:
-            await q.message.reply_photo(photo=photo, caption=caption, parse_mode='Markdown', reply_markup=kb)
+        if media:
+            # send media group first (if photo present)
+            if len(media) == 1:
+                await q.message.reply_photo(photo=media[0], caption=caption, parse_mode='Markdown', reply_markup=kb)
+            else:
+                # first photo with caption, others as media
+                media_group = []
+                for i, fid in enumerate(media):
+                    if i == 0:
+                        media_group.append(InputMediaPhoto(media=fid, caption=caption, parse_mode='Markdown'))
+                    else:
+                        media_group.append(InputMediaPhoto(media=fid))
+                await q.message.reply_media_group(media=media_group)
+                # also send inline keyboard as a separate message (since media_group doesn't accept reply_markup for group)
+                await q.message.reply_text(' ', reply_markup=kb)
         else:
             await q.message.reply_markdown(caption, reply_markup=kb)
     except Exception:
@@ -764,7 +978,7 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     try:
         await query.message.reply_text(
             f'Вы выбрали: {name} — {price}₽\n\n'
-            'Оплатите товар по номеру телефона 89002535363(сбер Николай М) и Отправьте скриншот оплаты (перевод/квитанция) в этот чат.\n'
+            'Олатите заказ по номеру телефона +79002535363(Николай М) Отправьте скриншот оплаты (перевод/квитанция) в этот чат.\n'
             'Если вы не указали PUBG ID — добавьте его в сообщении.'
         )
     except Exception:
@@ -788,7 +1002,7 @@ async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # If admin is adding a product and expecting photo -> handle there
     if is_admin_tg(user.id) and context.user_data.get('product_flow'):
         flow = context.user_data.get('product_flow', {})
-        if flow.get('stage') == 'photo':
+        if flow.get('stage') in ('photo', 'extra_photos'):
             await handle_add_product_flow(update, context)
             return
 
@@ -975,7 +1189,7 @@ async def performer_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             pass
         return
     status, product_id, price, created_at = order_row[0]
-    if status != 'paid':
+    if status != 'paid' and status != 'in_progress' and status != 'delivering':
         try:
             await query.answer(text='Этот функционал доступен только после подтверждения оплаты.', show_alert=True)
         except Exception:
@@ -1018,6 +1232,7 @@ async def performer_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         except Exception:
             pass
 
+    # update admin message caption
     buyer_row = db_execute('SELECT u.tg_id, u.username, u.pubg_id, p.name FROM orders o JOIN users u ON o.user_id=u.id JOIN products p ON o.product_id=p.id WHERE o.id=?', (order_id,), fetch=True)
     if buyer_row:
         buyer_tg_id, buyer_username, pubg_id, product_name = buyer_row[0]
@@ -1036,6 +1251,217 @@ async def performer_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=caption, reply_markup=kb)
         except Exception:
             logger.exception('Failed to update admin message after performer action')
+
+
+# Order progress callback: in_progress / delivering / done
+async def order_progress_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if q is None:
+        return
+    await q.answer()
+    data = q.data or ''
+    if not data.startswith('status:'):
+        return
+    _, oid_str, new_status = data.split(':', 2)
+    try:
+        order_id = int(oid_str)
+    except ValueError:
+        return
+
+    user = q.from_user
+    worker_id = user.id
+
+    # only workers assigned to order can change its progress
+    assigned = db_execute('SELECT worker_id FROM order_workers WHERE order_id=?', (order_id,), fetch=True) or []
+    assigned_ids = [r[0] for r in assigned]
+    if worker_id not in assigned_ids and not is_admin_tg(user.id):
+        try:
+            await q.answer(text='Только назначенные исполнители (или админ) могут менять статус.', show_alert=True)
+        except Exception:
+            pass
+        return
+
+    # get order
+    row = db_execute('SELECT status, user_id, product_id, price, created_at FROM orders WHERE id=?', (order_id,), fetch=True)
+    if not row:
+        try:
+            await q.answer(text='Заказ не найден.', show_alert=True)
+        except Exception:
+            pass
+        return
+    old_status, user_id, product_id, price, created_at = row[0]
+
+    # Update timestamps depending on new_status
+    now = now_iso()
+    if new_status == 'in_progress':
+        db_execute('UPDATE orders SET status=?, started_at=? WHERE id=?', (new_status, now, order_id))
+    elif new_status == 'delivering':
+        db_execute('UPDATE orders SET status=? WHERE id=?', (new_status, order_id))
+    elif new_status == 'done':
+        db_execute('UPDATE orders SET status=?, done_at=? WHERE id=?', (new_status, now, order_id))
+    else:
+        db_execute('UPDATE orders SET status=? WHERE id=?', (new_status, order_id))
+
+    # prepare caption update for admin group
+    buyer_row = db_execute('SELECT tg_id, username, pubg_id FROM users WHERE id=?', (user_id,), fetch=True)
+    if buyer_row:
+        buyer_tg = f"@{buyer_row[0][1]}" if buyer_row[0][1] else str(buyer_row[0][0])
+        pubg_id = buyer_row[0][2]
+    else:
+        buyer_tg = str(user_id)
+        pubg_id = None
+    product_name = db_execute('SELECT name FROM products WHERE id=?', (product_id,), fetch=True)[0][0]
+
+    # update admin message
+    status_row = db_execute('SELECT status, started_at, done_at FROM orders WHERE id=?', (order_id,), fetch=True)[0]
+    status_val, started_at, done_at = status_row
+    caption = build_caption_for_admin_message(order_id, buyer_tg, pubg_id, product_name, price, created_at, status_val, started_at, done_at)
+    kb = build_admin_keyboard_for_order(order_id, status_val)
+    try:
+        await q.edit_message_caption(caption, reply_markup=kb)
+    except Exception:
+        try:
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=caption, reply_markup=kb)
+        except Exception:
+            logger.exception('Failed to update admin message after status change')
+
+    try:
+        # notify buyer about status change
+        await context.bot.send_message(chat_id=buyer_row[0][0], text=f'Статус вашего заказа #{order_id} изменён: {status_val}')
+    except Exception:
+        logger.warning('Failed to notify buyer of status change')
+
+    # If done => calculate payouts and trigger review flow
+    if new_status == 'done':
+        await calculate_and_record_payouts(order_id, context)
+        # ask buyer to leave reviews for workers
+        # fetch buyer tg_id
+        buyer_tg_id = buyer_row[0][0] if buyer_row else None
+        if buyer_tg_id:
+            # fetch workers
+            workers = db_execute('SELECT worker_id, worker_username FROM order_workers WHERE order_id=? ORDER BY id', (order_id,), fetch=True)
+            if workers:
+                # send a message with a button to start reviews
+                kb2 = InlineKeyboardMarkup([[InlineKeyboardButton('Оставить отзыв', callback_data=f'leave_review:{order_id}')]])
+                try:
+                    await context.bot.send_message(chat_id=buyer_tg_id, text=f'Ваш заказ #{order_id} выполнен. Пожалуйста, оцените исполнителей.', reply_markup=kb2)
+                except Exception:
+                    logger.warning('Failed to prompt buyer for reviews')
+
+
+async def calculate_and_record_payouts(order_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Compute payouts for workers assigned to the order, record in worker_payouts,
+    and notify admins + workers.
+    Split equally between assigned workers.
+    """
+    order = db_execute('SELECT price FROM orders WHERE id=?', (order_id,), fetch=True)
+    if not order:
+        return
+    price = order[0][0]
+    workers = db_execute('SELECT worker_id, worker_username FROM order_workers WHERE order_id=? ORDER BY id', (order_id,), fetch=True) or []
+    if not workers:
+        # no workers assigned: notify owner
+        try:
+            await context.bot.send_message(chat_id=OWNER_ID, text=f'Заказ #{order_id} отмечен как выполненный, но исполнителей не найдено для выплаты.')
+        except Exception:
+            pass
+        return
+    num = len(workers)
+    total_for_workers = round(price * WORKER_PERCENT, 2)
+    per_worker = round(total_for_workers / num, 2) if num > 0 else 0.0
+    store = []
+    for w in workers:
+        wid = w[0]
+        db_execute('INSERT INTO worker_payouts (order_id, worker_id, amount, created_at) VALUES (?, ?, ?, ?)',
+                   (order_id, wid, per_worker, now_iso()))
+        store.append((wid, per_worker, w[1] or ''))
+    # notify admin(s) about payouts
+    summary_lines = [f'Заказ #{order_id} выполнен — общая сумма: {price}₽', f'Всего исполнителей: {num}', f'Доля исполнителей (в сумме): {total_for_workers}₽', 'Выплаты:']
+    for wid, amount, wname in store:
+        summary_lines.append(f'- @{wname or str(wid)}: {amount}₽')
+    summary = '\n'.join(summary_lines)
+    try:
+        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=summary)
+    except Exception:
+        try:
+            await context.bot.send_message(chat_id=OWNER_ID, text=summary)
+        except Exception:
+            pass
+
+    # notify each worker privately
+    for wid, amount, wname in store:
+        try:
+            await context.bot.send_message(chat_id=wid, text=f'Заказ #{order_id} выполнен. Ваша выплата: {amount}₽ (список выплат доступен админам).')
+        except Exception:
+            logger.warning('Failed to notify worker %s', wid)
+
+
+# Callback to open review flow (buttons)
+async def leave_review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if q is None:
+        return
+    await q.answer()
+    data = q.data or ''
+    if not data.startswith('leave_review:'):
+        return
+    _, oid_str = data.split(':', 1)
+    try:
+        order_id = int(oid_str)
+    except ValueError:
+        return
+    # fetch workers for this order
+    workers = db_execute('SELECT worker_id, worker_username FROM order_workers WHERE order_id=? ORDER BY id', (order_id,), fetch=True)
+    if not workers:
+        try:
+            await q.message.reply_text('На этот заказ нет назначенных исполнителей.')
+        except Exception:
+            pass
+        return
+    # If only one worker -> ask rating directly
+    if len(workers) == 1:
+        wid, wname = workers[0]
+        context.user_data['review_flow'] = {'stage': 'awaiting_rating', 'order_id': order_id, 'worker_id': wid, 'done_workers': []}
+        try:
+            await q.message.reply_text(f'Оцените исполнителя @{wname} (1-5)', reply_markup=CANCEL_BUTTON)
+        except Exception:
+            pass
+        return
+    # multiple workers -> present inline list to choose whom to review (or do all sequentially)
+    kb_rows = []
+    for wid, wname in workers:
+        kb_rows.append([InlineKeyboardButton(text=f'@{wname}', callback_data=f'review_worker:{order_id}:{wid}')])
+    try:
+        await q.message.reply_text('Выберите исполнителя для отзыва (можно повторять для всех):', reply_markup=InlineKeyboardMarkup(kb_rows))
+    except Exception:
+        pass
+
+
+# callback when user selects a worker to review
+async def review_worker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if q is None:
+        return
+    await q.answer()
+    data = q.data or ''
+    if not data.startswith('review_worker:'):
+        return
+    _, oid_str, wid_str = data.split(':', 2)
+    try:
+        order_id = int(oid_str)
+        worker_id = int(wid_str)
+    except ValueError:
+        return
+    # store flow
+    context.user_data['review_flow'] = {'stage': 'awaiting_rating', 'order_id': order_id, 'worker_id': worker_id, 'done_workers': []}
+    # fetch worker username
+    row = db_execute('SELECT worker_username FROM order_workers WHERE order_id=? AND worker_id=?', (order_id, worker_id), fetch=True)
+    wname = row[0][0] if row else str(worker_id)
+    try:
+        await q.message.reply_text(f'Оцените исполнителя @{wname} (1-5)', reply_markup=CANCEL_BUTTON)
+    except Exception:
+        pass
 
 
 # Admin panel and small admin helpers
@@ -1148,6 +1574,51 @@ async def add_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(f'Товар добавлен: {name} — {price}₽', reply_markup=ADMIN_PANEL_KB)
 
 
+# Worker stats command (/worker)
+async def worker_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if user is None:
+        return
+    wid = user.id
+    # total taken
+    total_taken_row = db_execute('SELECT COUNT(*) FROM order_workers WHERE worker_id=?', (wid,), fetch=True)
+    total_taken = total_taken_row[0][0] if total_taken_row else 0
+    # total completed (orders where this worker is in order_workers and order status == done)
+    total_done_row = db_execute('SELECT COUNT(DISTINCT o.id) FROM orders o JOIN order_workers w ON o.id=w.order_id WHERE w.worker_id=? AND o.status=?', (wid, 'done'), fetch=True)
+    total_done = total_done_row[0][0] if total_done_row else 0
+    # avg time: for orders where worker took and order done -> average(done_at - taken_at)
+    rows = db_execute('SELECT o.created_at, o.started_at, o.done_at, w.taken_at FROM orders o JOIN order_workers w ON o.id=w.order_id WHERE w.worker_id=? AND o.status=?', (wid, 'done'), fetch=True)
+    avg_secs = None
+    if rows:
+        deltas = []
+        for created_at, started_at, done_at, taken_at in rows:
+            try:
+                dt_taken = datetime.fromisoformat(taken_at) if taken_at else None
+                dt_done = datetime.fromisoformat(done_at) if done_at else None
+                if dt_taken and dt_done:
+                    delta = (dt_done - dt_taken).total_seconds()
+                    if delta >= 0:
+                        deltas.append(delta)
+            except Exception:
+                pass
+        if deltas:
+            avg_secs = sum(deltas) / len(deltas)
+    avg_time = f"{int(avg_secs//60)} мин" if avg_secs else "—"
+
+    # average rating for this worker
+    rating_row = db_execute('SELECT AVG(rating) FROM reviews WHERE worker_id=?', (wid,), fetch=True)
+    avg_rating = rating_row[0][0] if rating_row and rating_row[0][0] is not None else None
+
+    text_lines = [
+        f'🧾 Статистика исполнителя @{user.username or user.first_name}',
+        f'Взято заказов: {total_taken}',
+        f'Выполнено: {total_done}',
+        f'Среднее время выполнения: {avg_time}',
+        f'Средний рейтинг: {avg_rating:.2f}' if avg_rating else 'Средний рейтинг: —',
+    ]
+    await update.message.reply_text('\n'.join(text_lines), reply_markup=MAIN_MENU)
+
+
 # Global error handler
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error(msg="Exception while handling an update:", exc_info=context.error)
@@ -1167,18 +1638,22 @@ def build_app():
 
     # user flows
     app.add_handler(CommandHandler('start', start), group=1)
+    app.add_handler(CommandHandler('worker', worker_stats_handler), group=1)  # new
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router), group=1)
 
     # photo router (routes admin product photos -> product flows, else -> payment handler)
     app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, photo_router), group=1)
 
-    # callbacks for product browsing / buy
+    # callbacks for product browsing / buy / details
     app.add_handler(CallbackQueryHandler(buy_callback, pattern=r'^buy:'), group=1)
     app.add_handler(CallbackQueryHandler(product_detail_callback, pattern=r'^detail:'), group=1)
 
     # admin / performer callbacks
     app.add_handler(CallbackQueryHandler(admin_decision, pattern=r'^(confirm:|reject:)'), group=2)
     app.add_handler(CallbackQueryHandler(performer_action, pattern=r'^(take:|leave:)'), group=2)
+    app.add_handler(CallbackQueryHandler(order_progress_callback, pattern=r'^status:'), group=2)
+    app.add_handler(CallbackQueryHandler(leave_review_callback, pattern=r'^leave_review:'), group=2)
+    app.add_handler(CallbackQueryHandler(review_worker_callback, pattern=r'^review_worker:'), group=2)
 
     # product edit/delete callbacks
     app.add_handler(CallbackQueryHandler(editfield_callback, pattern=r'^editfield:'), group=2)
