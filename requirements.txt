@@ -1,4 +1,5 @@
-aiogram==3.17.0
-aiohttp==3.9.0
-python-dotenv==1.0.0
-requests==2.31.0
+aiogram
+aiohttp
+python-dotenv
+requests
+telegram
