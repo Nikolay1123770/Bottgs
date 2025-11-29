@@ -37,7 +37,7 @@ from telegram.ext import (
 from telegram.error import BadRequest
 
 # --- Configuration ---
-TG_BOT_TOKEN = os.getenv('TG_BOT_TOKEN', '8269807126:AAE8oh3FvOK-8PjSf9YQYn12aYEgg-g21qQ')
+TG_BOT_TOKEN = os.getenv('TG_BOT_TOKEN', '8269807126:AAFh4LQOnoKawEXFrbA7vVBFfDXn-JB0ixQ')
 OWNER_ID = int(os.getenv('OWNER_ID', '8473513085'))
 ADMIN_CHAT_ID = int(os.getenv('ADMIN_CHAT_ID', '-1003448809517'))
 NOTIFY_CHAT_IDS = [int(x) for x in os.getenv('NOTIFY_CHAT_IDS', '-1003448809517').split(',') if x.strip()]
@@ -404,7 +404,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     if text == '📞 Поддержка':
         bot_username = context.bot.username or 'админ'
-        await update.message.reply_text('Свяжитесь с владельцем: @zavik911' + bot_username, reply_markup=MAIN_MENU)
+        await update.message.reply_text('Свяжитесь с владельцем: @' + bot_username, reply_markup=MAIN_MENU)
         return
     if text == '↩️ Назад':
         await update.message.reply_text('Вернулись в меню.', reply_markup=MAIN_MENU)
@@ -937,7 +937,6 @@ async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # User pressed "Купить" inline button
-# User pressed "Купить" inline button
 async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if query is None:
@@ -950,7 +949,6 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     data = query.data or ''
     if not data.startswith('buy:'):
         return
-
     _, pid_str = data.split(':', 1)
     try:
         pid = int(pid_str)
@@ -964,60 +962,27 @@ async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         except Exception:
             pass
         return
-
     prod_id, name, price = p[0]
 
     user = query.from_user
-
-    # --- FIXED: this block MUST be indented ---
-    db_execute(
-        'INSERT OR IGNORE INTO users (tg_id, username, registered_at) VALUES (?, ?, ?)',
-        (user.id, user.username or '', now_iso())
-    )
-    user_row = db_execute(
-        'SELECT id, pubg_id FROM users WHERE tg_id=?',
-        (user.id,), fetch=True
-    )
+    db_execute('INSERT OR IGNORE INTO users (tg_id, username, registered_at) VALUES (?, ?, ?)',
+               (user.id, user.username or '', now_iso()))
+    user_row = db_execute('SELECT id, pubg_id FROM users WHERE tg_id=?', (user.id,), fetch=True)
     user_db_id = user_row[0][0]
     pubg_id = user_row[0][1]
 
-    # create new order
-    db_execute(
-        'INSERT INTO orders (user_id, product_id, price, status, created_at, pubg_id) VALUES (?, ?, ?, ?, ?, ?)',
-        (user_db_id, prod_id, price, 'awaiting_screenshot', now_iso(), pubg_id)
-    )
+    # create order awaiting screenshot
+    db_execute('INSERT INTO orders (user_id, product_id, price, status, created_at, pubg_id) VALUES (?, ?, ?, ?, ?, ?)',
+               (user_db_id, prod_id, price, 'awaiting_screenshot', now_iso(), pubg_id))
 
-    # get inserted order id
-    order_id = db_execute(
-        'SELECT id FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 1',
-        (user_db_id,), fetch=True
-    )[0][0]
-
-    # --- CloudTips dynamic payment link ---
     try:
-        cloudtips_link = (
-            f"https://pay.cloudtips.ru/p/2842e969?"
-            f"amount={price}&payload={order_id}"
-        )
-
         await query.message.reply_text(
             f'Вы выбрали: {name} — {price}₽\n\n'
-            '💳 *Оплата через CloudTips*\n'
-            'Нажмите кнопку ниже, чтобы перейти к оплате.\n\n'
-            'После оплаты отправьте *скриншот платежа*.\n'
-            'Если вы не указали PUBG ID — добавьте его в сообщении.',
-            parse_mode='Markdown',
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("💳 Оплатить через CloudTips", url=cloudtips_link)]
-            ])
+            'Оплатите заказ по номеру телефона +79002535363(сбер Николай М)Отправьте скриншот оплаты (перевод/квитанция) в этот чат.\n'
+            'Если вы не указали PUBG ID — добавьте его в сообщении.'
         )
-
-    except Exception as e:
-        print("CloudTips error:", e)
+    except Exception:
         pass
-
-
-
 
 
 # --- Photo routing: either admin product-photo flows OR payment screenshots ---
@@ -1663,81 +1628,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     except Exception:
         pass
 
-# -------------------- CLOUDTIPS WEBHOOK API --------------------
-from fastapi import FastAPI, Request
-import uvicorn
-
-api = FastAPI()
-
-@api.post("/cloudtips_webhook")
-async def cloudtips_webhook(request: Request):
-    data = await request.json()
-
-    # пример данных CloudTips:
-    # {
-    #   "id": "...",
-    #   "status": "paid",
-    #   "amount": "300",
-    #   "payload": "123"
-    # }
-
-    status = data.get("status")
-    payload = data.get("payload")
-
-    # нужен только статус paid
-    if status != "paid":
-        return {"ok": True}
-
-    if not payload:
-        return {"ok": False}
-
-    try:
-        order_id = int(payload)
-    except:
-        return {"ok": False}
-
-    # обновить заказ как оплаченный
-    db_execute(
-        "UPDATE orders SET status='paid', admin_notes='Оплата подтверждена автоматически (CloudTips)' WHERE id=?",
-        (order_id,)
-    )
-
-    # получить данные заказа
-    row = db_execute(
-        "SELECT user_id, product_id, price, created_at FROM orders WHERE id=?", 
-        (order_id,), 
-        fetch=True
-    )
-    if not row:
-        return {"ok": True}
-
-    user_id, product_id, price, created_at = row[0]
-
-    # получить Telegram ID покупателя
-    tg_row = db_execute("SELECT tg_id FROM users WHERE id=?", (user_id,), fetch=True)
-    if tg_row:
-        tg_id = tg_row[0][0]
-
-        # уведомление клиенту
-        try:
-            await bot.send_message(
-                chat_id=tg_id,
-                text=f"💳 Оплата подтверждена автоматически!\nВаш заказ #{order_id} оплачен."
-            )
-        except:
-            pass
-
-    # уведомление админам
-    try:
-        await bot.send_message(
-            chat_id=ADMIN_CHAT_ID,
-            text=f"🔔 Автоматически подтверждена оплата заказа #{order_id} (CloudTips)."
-        )
-    except:
-        pass
-
-    return {"ok": True}
-    
 
 def build_app():
     init_db()
@@ -1779,19 +1669,9 @@ def build_app():
 
     app.add_error_handler(error_handler)
     return app
-    
-    
-    # -------------------- RUN BOTH BOT + WEBHOOK SERVER --------------------
+
+
 if __name__ == "__main__":
-    import threading
-    
-    # запускаем Telegram бота
-    def run_bot():
-        app = build_app()
-        app.run_polling()
-
-    threading.Thread(target=run_bot).start()
-
-    # запускаем FastAPI для webhook CloudTips
-    uvicorn.run(api, host="0.0.0.0", port=8000)
-   
+    init_db()
+    application = build_app()
+    application.run_polling()
