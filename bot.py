@@ -19,13 +19,14 @@ from datetime import datetime
 from typing import List, Optional
 
 from telegram import (
-    Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
     KeyboardButton,
     InputMediaPhoto,
 )
+from telegram.update import Update
+
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
