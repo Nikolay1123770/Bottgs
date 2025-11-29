@@ -25,7 +25,8 @@ from telegram import (
     KeyboardButton,
     InputMediaPhoto,
 )
-from telegram.update import Update
+from telegram import Update
+
 
 
 from telegram.ext import (
