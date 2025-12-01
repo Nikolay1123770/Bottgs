@@ -55,7 +55,7 @@ if os.getenv('ADMIN_IDS'):
 MAX_WORKERS_PER_ORDER = int(os.getenv('MAX_WORKERS_PER_ORDER', '3'))
 
 # Percent to pay to workers (0.0 - 1.0). Will be split equally across workers assigned.
-WORKER_PERCENT = float(os.getenv('WORKER_PERCENT', '0.7'))
+WORKER_PERCENT = float(os.getenv('WORKER_PERCENT', '0.85'))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
