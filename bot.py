@@ -13,6 +13,7 @@ Requires: python-telegram-bot v20+
 """
 
 import os
+import asyncio
 import sqlite3
 import logging
 from datetime import datetime
@@ -40,7 +41,7 @@ from telegram.ext import (
 from telegram.error import BadRequest
 
 # --- Configuration ---
-TG_BOT_TOKEN = os.getenv('TG_BOT_TOKEN', '8269807126:AAFh4LQOnoKawEXFrbA7vVBFfDXn-JB0ixQ')
+TG_BOT_TOKEN = os.getenv('TG_BOT_TOKEN', '8593344199:AAHYqcmtiX9v1ZHZ-rIBcuj3EjtKJT6vHfs')
 OWNER_ID = int(os.getenv('OWNER_ID', '8473513085'))
 ADMIN_CHAT_ID = int(os.getenv('ADMIN_CHAT_ID', '-1003448809517'))
 NOTIFY_CHAT_IDS = [int(x) for x in os.getenv('NOTIFY_CHAT_IDS', '-1003448809517').split(',') if x.strip()]
@@ -800,120 +801,141 @@ async def edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 # --- Products display and buy flows ---
 def _get_product_rating_and_count(pid: int):
-    """Compute average rating across reviews for workers on orders of this product and number of completed orders."""
-    # average rating: all reviews for orders where product_id == pid
-    rows = db_execute('SELECT r.rating FROM reviews r JOIN orders o ON r.order_id=o.id WHERE o.product_id=?', (pid,), fetch=True)
-    if not rows:
-        avg = None
-    else:
-        vals = [r[0] for r in rows if r[0] is not None]
-        avg = (sum(vals) / len(vals)) if vals else None
-    completed_count_row = db_execute('SELECT COUNT(*) FROM orders WHERE product_id=? AND status=?', (pid, 'done'), fetch=True)
-    completed_count = completed_count_row[0][0] if completed_count_row else 0
-    return avg, completed_count
+    rows = db_execute(
+        'SELECT r.rating FROM reviews r JOIN orders o ON r.order_id=o.id WHERE o.product_id=?',
+        (pid,), fetch=True
+    )
+    vals = [r[0] for r in rows if r[0] is not None] if rows else []
+    avg = (sum(vals) / len(vals)) if vals else None
+
+    done = db_execute(
+        'SELECT COUNT(*) FROM orders WHERE product_id=? AND status=?',
+        (pid, 'done'), fetch=True
+    )
+    completed = done[0][0] if done else 0
+    return avg, completed
 
 
 async def products_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    products = db_execute('SELECT id, name, description, price, photo FROM products ORDER BY id', fetch=True)
+    products = db_execute(
+        'SELECT id, name, description, price, photo FROM products ORDER BY id',
+        fetch=True
+    )
     if not products:
-        await update.message.reply_text('Каталог пуст. Админ может добавить товары.', reply_markup=MAIN_MENU)
+        await update.message.reply_text("Каталог пуст.", reply_markup=MAIN_MENU)
         return
 
     for pid, name, desc, price, photo in products:
+
         avg, completed_count = _get_product_rating_and_count(pid)
-        rating_line = f"⭐ {avg:.1f} (отзывы)" if avg is not None else "—"
-        caption = f"🛒 *{name}*\n{desc or ''}\n\n💰 Цена: *{price}₽*\n{rating_line} • Выполнено: {completed_count}"
+        stars = "⭐" * int(round(avg)) if avg else ""
+        rating_line = f"{stars} {avg:.1f}" if avg else "Нет отзывов"
+
+        caption = (
+            f"🛒 *{name}*\n"
+            f"{desc or ''}\n\n"
+            f"💰 Цена: *{price}₽*\n"
+            f"{rating_line} • Выполнено: {completed_count}"
+        )
+
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(text=f'Купить — {price}₽', callback_data=f'buy:{pid}'),
-             InlineKeyboardButton(text='ℹ️ Подробнее', callback_data=f'detail:{pid}')]
+            [InlineKeyboardButton("Отзывы ⭐", callback_data=f"reviews_{pid}_1")],
+            [
+                InlineKeyboardButton(f"Купить — {price}₽", callback_data=f"buy:{pid}"),
+                InlineKeyboardButton("ℹ️ Подробнее", callback_data=f"detail:{pid}")
+            ]
         ])
+
         try:
+            sender = (update.message.reply_photo if update.message else update.callback_query.message.reply_photo)
+
             if photo:
-                if update.message:
-                    await update.message.reply_photo(photo=photo, caption=caption, reply_markup=kb, parse_mode='Markdown')
-                else:
-                    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=photo, caption=caption, reply_markup=kb, parse_mode='Markdown')
+                await sender(photo=photo, caption=caption, parse_mode="Markdown", reply_markup=kb)
             else:
-                if update.message:
-                    await update.message.reply_markdown(caption, reply_markup=kb)
-                else:
-                    await context.bot.send_message(chat_id=update.effective_chat.id, text=caption, reply_markup=kb)
-        except Exception:
-            try:
-                await context.bot.send_message(chat_id=update.effective_chat.id, text=caption, reply_markup=kb)
-            except Exception:
-                logger.exception("Failed to send product %s", pid)
+                await sender(caption, parse_mode="Markdown", reply_markup=kb)
+            await asyncio.sleep(0.3)
 
-    if update.message:
-        await update.message.reply_text('Выберите товар, чтобы купить, или вернитесь в меню.', reply_markup=MAIN_MENU)
+        except Exception as e:
+            logger.exception("FAILED product send: %s", e)
+            await update.effective_chat.send_message(caption, parse_mode="Markdown", reply_markup=kb)
+
+    await update.message.reply_text(
+        "Выберите товар, чтобы купить, или вернитесь в меню.",
+        reply_markup=MAIN_MENU
+    )
 
 
-# Product details callback
+
+# ============================================
+# PRODUCT DETAILS + EXTRA PHOTOS
+# ============================================
+
 async def product_detail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
-    if q is None:
-        return
     await q.answer()
-    data = q.data or ''
-    if not data.startswith('detail:'):
-        return
-    _, pid_str = data.split(':', 1)
-    try:
-        pid = int(pid_str)
-    except ValueError:
-        return
-    row = db_execute('SELECT name, description, price, photo FROM products WHERE id=?', (pid,), fetch=True)
-    if not row:
-        try:
-            await q.edit_message_text('Товар не найден.')
-        except Exception:
-            pass
-        return
-    name, desc, price, photo = row[0]
-    avg, completed_count = _get_product_rating_and_count(pid)
-    rating_line = f"⭐ {avg:.1f} (по отзывам)" if avg is not None else "Нет оценок"
-    caption = f"*{name}*\n\n{desc or ''}\n\n💰 Цена: *{price}₽*\n{rating_line} • Выполнено: {completed_count}"
 
-    # fetch extra photos
-    photos = db_execute('SELECT file_id FROM product_photos WHERE product_id=? ORDER BY id', (pid,), fetch=True) or []
-    file_ids = [p[0] for p in photos]
-    # include main photo as first if exists
-    if photo:
-        if not file_ids or file_ids[0] != photo:
-            media = [photo] + file_ids
-        else:
-            media = file_ids
+    _, pid_str = q.data.split(":")
+    pid = int(pid_str)
+
+    row = db_execute(
+        'SELECT name, description, price, photo FROM products WHERE id=?',
+        (pid,), fetch=True
+    )
+    if not row:
+        await q.edit_message_text("Товар не найден.")
+        return
+
+    name, desc, price, main_photo = row[0]
+    avg, completed = _get_product_rating_and_count(pid)
+
+    if avg:
+        stars = "⭐" * round(avg)
+        rating_line = f"{stars} ({avg:.1f})"
     else:
-        media = file_ids
+        rating_line = "Нет оценок"
+
+    caption = (
+        f"🛒 *{name}*\n"
+        f"{desc or ''}\n\n"
+        f"💰 Цена: *{price}₽*\n"
+        f"{rating_line} • Выполнено: {completed}"
+    )
+
+    # Загружаем доп. фото
+    photos = db_execute(
+        'SELECT file_id FROM product_photos WHERE product_id=? ORDER BY id',
+        (pid,), fetch=True
+    )
+    file_ids = [p[0] for p in photos]
+
+    media = []
+    if main_photo:
+        media.append(main_photo)
+    media.extend(file_ids)
 
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(text=f'Купить — {price}₽', callback_data=f'buy:{pid}'),
-         InlineKeyboardButton(text='Редактировать', callback_data=f'edit:{pid}'),
-         InlineKeyboardButton(text='Удалить', callback_data=f'delete:{pid}')]
+        [InlineKeyboardButton("⭐ Отзывы", callback_data=f"reviews_{pid}_1")],
+        [InlineKeyboardButton(f"Купить — {price}₽", callback_data=f"buy:{pid}")],
+        [InlineKeyboardButton("↩ Назад", callback_data="catalog_back")],
     ])
+
     try:
-        if media:
-            # send media group first (if photo present)
-            if len(media) == 1:
-                await q.message.reply_photo(photo=media[0], caption=caption, parse_mode='Markdown', reply_markup=kb)
-            else:
-                # first photo with caption, others as media
-                media_group = []
-                for i, fid in enumerate(media):
-                    if i == 0:
-                        media_group.append(InputMediaPhoto(media=fid, caption=caption, parse_mode='Markdown'))
-                    else:
-                        media_group.append(InputMediaPhoto(media=fid))
-                await q.message.reply_media_group(media=media_group)
-                # also send inline keyboard as a separate message (since media_group doesn't accept reply_markup for group)
-                await q.message.reply_text(' ', reply_markup=kb)
+        if len(media) == 1:
+            await q.message.reply_photo(photo=media[0], caption=caption, parse_mode="Markdown", reply_markup=kb)
         else:
-            await q.message.reply_markdown(caption, reply_markup=kb)
-    except Exception:
-        try:
-            await q.edit_message_text(caption)
-        except Exception:
-            pass
+            group = []
+            for i, ph in enumerate(media):
+                if i == 0:
+                    group.append(InputMediaPhoto(ph, caption=caption, parse_mode="Markdown"))
+                else:
+                    group.append(InputMediaPhoto(ph))
+
+            await q.message.reply_media_group(group)
+            await q.message.reply_text(" ", reply_markup=kb)
+
+    except:
+        await q.edit_message_text(caption, parse_mode="Markdown", reply_markup=kb)
+
 
 
 async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1555,6 +1577,7 @@ async def setphoto_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     db_execute('UPDATE products SET photo=? WHERE id=?', (file_id, pid))
     await msg.reply_text(f'Фото установлено для товара {pid}', reply_markup=ADMIN_PANEL_KB)
+    
 
 
 # Command /add <name> <price> <description> (admin only)
@@ -1582,15 +1605,34 @@ async def worker_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     user = update.effective_user
     if user is None:
         return
+
     wid = user.id
+
     # total taken
-    total_taken_row = db_execute('SELECT COUNT(*) FROM order_workers WHERE worker_id=?', (wid,), fetch=True)
+    total_taken_row = db_execute(
+        'SELECT COUNT(*) FROM order_workers WHERE worker_id=?',
+        (wid,), fetch=True
+    )
     total_taken = total_taken_row[0][0] if total_taken_row else 0
-    # total completed (orders where this worker is in order_workers and order status == done)
-    total_done_row = db_execute('SELECT COUNT(DISTINCT o.id) FROM orders o JOIN order_workers w ON o.id=w.order_id WHERE w.worker_id=? AND o.status=?', (wid, 'done'), fetch=True)
+
+    # total completed
+    total_done_row = db_execute(
+        '''SELECT COUNT(DISTINCT o.id)
+           FROM orders o 
+           JOIN order_workers w ON o.id=w.order_id
+           WHERE w.worker_id=? AND o.status=?''',
+        (wid, 'done'), fetch=True
+    )
     total_done = total_done_row[0][0] if total_done_row else 0
-    # avg time: for orders where worker took and order done -> average(done_at - taken_at)
-    rows = db_execute('SELECT o.created_at, o.started_at, o.done_at, w.taken_at FROM orders o JOIN order_workers w ON o.id=w.order_id WHERE w.worker_id=? AND o.status=?', (wid, 'done'), fetch=True)
+
+    # avg time calculation
+    rows = db_execute(
+        '''SELECT o.created_at, o.started_at, o.done_at, w.taken_at
+           FROM orders o
+           JOIN order_workers w ON o.id=w.order_id
+           WHERE w.worker_id=? AND o.status=?''',
+        (wid, 'done'), fetch=True
+    )
     avg_secs = None
     if rows:
         deltas = []
@@ -1606,10 +1648,14 @@ async def worker_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 pass
         if deltas:
             avg_secs = sum(deltas) / len(deltas)
+
     avg_time = f"{int(avg_secs//60)} мин" if avg_secs else "—"
 
-    # average rating for this worker
-    rating_row = db_execute('SELECT AVG(rating) FROM reviews WHERE worker_id=?', (wid,), fetch=True)
+    # avg rating
+    rating_row = db_execute(
+        'SELECT AVG(rating) FROM reviews WHERE worker_id=?',
+        (wid,), fetch=True
+    )
     avg_rating = rating_row[0][0] if rating_row and rating_row[0][0] is not None else None
 
     text_lines = [
@@ -1619,8 +1665,220 @@ async def worker_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         f'Среднее время выполнения: {avg_time}',
         f'Средний рейтинг: {avg_rating:.2f}' if avg_rating else 'Средний рейтинг: —',
     ]
+
     await update.message.reply_text('\n'.join(text_lines), reply_markup=MAIN_MENU)
 
+# Bot stats command (/stats)
+async def bot_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin_tg(user.id):
+        await update.message.reply_text("Только для админа.")
+        return
+
+    total_users = db_execute("SELECT COUNT(*) FROM users", fetch=True)[0][0]
+    total_orders = db_execute("SELECT COUNT(*) FROM orders", fetch=True)[0][0]
+    paid_orders = db_execute("SELECT COUNT(*) FROM orders WHERE status='paid'", fetch=True)[0][0]
+    done_orders = db_execute("SELECT COUNT(*) FROM orders WHERE status='done'", fetch=True)[0][0]
+    total_products = db_execute("SELECT COUNT(*) FROM products", fetch=True)[0][0]
+
+    text = (
+        "📊 *Статистика бота*\n\n"
+        f"👥 Пользователей: *{total_users}*\n"
+        f"📦 Товаров: *{total_products}*\n\n"
+        f"🛒 Всего заказов: *{total_orders}*\n"
+        f"💳 Оплачено: *{paid_orders}*\n"
+        f"🏁 Выполнено: *{done_orders}*"
+    )
+
+    await update.message.reply_markdown(text, reply_markup=MAIN_MENU)
+
+
+
+async def product_reviews_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data.split("_")      # reviews_12_1
+    product_id = int(data[1])
+    page = int(data[2])
+
+    per_page = 1  # по одному отзыву на страницу
+    offset = (page - 1) * per_page
+
+    rows = db_execute(
+        '''
+        SELECT r.rating, r.text, r.created_at
+        FROM reviews r
+        JOIN orders o ON r.order_id = o.id
+        WHERE o.product_id = ?
+        ORDER BY r.created_at DESC
+        LIMIT ? OFFSET ?
+        ''',
+        (product_id, per_page, offset),
+        fetch=True
+    )
+
+    count_row = db_execute(
+        '''
+        SELECT COUNT(*)
+        FROM reviews r
+        JOIN orders o ON r.order_id = o.id
+        WHERE o.product_id = ?
+        ''',
+        (product_id,),
+        fetch=True
+    )
+    total = count_row[0][0]
+        # вычисляем количество страниц
+    per_page = 1
+    total_pages = (total + per_page - 1) // per_page
+    
+
+    if not rows:
+        try:
+            await query.edit_message_caption("Отзывов пока нет 😔")
+        except:
+            try:
+                await query.edit_message_text("Отзывов пока нет 😔")
+            except:
+                pass
+        return
+
+    rating, text, created = rows[0]
+
+    stars = "⭐" * rating + "☆" * (5 - rating)
+
+    msg = (
+        f"<b>Отзыв о товаре:</b>\n\n"
+        f"{stars}\n"
+        f"<i>{text or 'Без комментария'}</i>\n\n"
+        f"🕒 {created}"
+    )
+
+
+    # --- Показываем отзыв ---
+    rating, text, created = rows[0]
+    stars = "⭐" * rating + "☆" * (5 - rating)
+
+    msg = (
+        f"<b>Отзыв о товаре:</b>\n\n"
+        f"{stars}\n"
+        f"<i>{text or 'Без комментария'}</i>\n\n"
+        f"🕒 {created}"
+    )
+
+    # --- Кнопки навигации ---
+    buttons = []
+
+    if page > 1:
+        buttons.append(
+            InlineKeyboardButton("⬅️ Назад", callback_data=f"reviews_{product_id}_{page-1}")
+        )
+
+    if page < total_pages:
+        buttons.append(
+            InlineKeyboardButton("Вперёд ➡️", callback_data=f"reviews_{product_id}_{page+1}")
+        )
+
+    # Вернуться к товару
+    buttons.append(
+        InlineKeyboardButton("⬅️ Назад к товару", callback_data=f"detail:{product_id}")
+    )
+
+    keyboard = InlineKeyboardMarkup([buttons])
+
+    # Пытаемся обновить сообщение
+    try:
+        await query.edit_message_caption(
+            caption=msg,
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
+    except:
+        try:
+            await query.edit_message_text(
+                msg,
+                reply_markup=keyboard,
+                parse_mode="HTML"
+            )
+        except:
+            pass
+
+
+
+    
+
+async def show_product(update: Update, context: ContextTypes.DEFAULT_TYPE, product_id: int):
+    """Показывает карточку товара в каталоге (как при первом просмотре)."""
+
+    row = db_execute(
+        'SELECT id, name, description, price, photo FROM products WHERE id=?',
+        (product_id,), fetch=True
+    )
+    if not row:
+        await update.effective_chat.send_message("Товар не найден.")
+        return
+
+    pid, name, desc, price, photo = row[0]
+
+    # рейтинг и количество
+    avg, completed_count = _get_product_rating_and_count(pid)
+    if avg:
+        stars = "⭐" * round(avg)
+        rating_line = f"{stars} {avg:.1f} • Выполнено: {completed_count}"
+    else:
+        rating_line = "⭐ — • Выполнено: 0"
+
+    caption = (
+        f"🛒 *{name}*\n"
+        f"{desc or ''}\n\n"
+        f"💰 Цена: *{price}₽*\n"
+        f"{rating_line}"
+    )
+
+    # кнопки
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(f"Купить — {price}₽", callback_data=f"buy:{pid}"),
+            InlineKeyboardButton("ОТЗЫВЫ ⭐", callback_data=f"reviews_{pid}")
+        ],
+        [
+            InlineKeyboardButton("↩ Назад", callback_data="catalog_back")
+        ]
+    ])
+
+    # показать сообщение
+    try:
+        if photo:
+            await update.effective_chat.send_photo(
+                photo=photo,
+                caption=caption,
+                parse_mode="Markdown",
+                reply_markup=kb
+            )
+        else:
+            await update.effective_chat.send_message(
+                text=caption,
+                parse_mode="Markdown",
+                reply_markup=kb
+            )
+    except Exception as e:
+        await update.effective_chat.send_message(
+            text=caption,
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+        
+async def product_return_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    product_id = int(query.data.split("_")[1])
+
+    await product_detail_callback(update, context, product_id)
+    
+     
+    
 
 # Global error handler
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1642,7 +1900,9 @@ def build_app():
     # user flows
     app.add_handler(CommandHandler('start', start), group=1)
     app.add_handler(CommandHandler('worker', worker_stats_handler), group=1)  # new
+    app.add_handler(CommandHandler('stats', bot_stats_handler), group=1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router), group=1)
+    
 
     # photo router (routes admin product photos -> product flows, else -> payment handler)
     app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, photo_router), group=1)
@@ -1650,6 +1910,8 @@ def build_app():
     # callbacks for product browsing / buy / details
     app.add_handler(CallbackQueryHandler(buy_callback, pattern=r'^buy:'), group=1)
     app.add_handler(CallbackQueryHandler(product_detail_callback, pattern=r'^detail:'), group=1)
+    app.add_handler(CallbackQueryHandler(product_reviews_handler, pattern=r"^reviews_"))
+    CallbackQueryHandler(product_detail_callback, pattern=r"^product_")
 
     # admin / performer callbacks
     app.add_handler(CallbackQueryHandler(admin_decision, pattern=r'^(confirm:|reject:)'), group=2)
