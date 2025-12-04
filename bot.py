@@ -369,46 +369,114 @@ async def handle_review_flow(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
 
 
+
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # ignore admin group messages
-    if update.effective_chat and update.effective_chat.id == ADMIN_CHAT_ID:
+    user = update.message.from_user
+    text = update.message.text
+
+    # --- обработка текста отзыва ---
+    if context.user_data.get("awaiting_review_text"):
+        order_id = context.user_data.get("review_order_id")
+        rating = context.user_data.get("review_rating")
+
+        db_execute(
+    "INSERT INTO reviews (order_id, buyer_id, worker_id, rating, text, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    (order_id, user.id, None, rating, text, now_iso())
+)
+
+
+        # очистка
+        context.user_data.pop("awaiting_review_text", None)
+        context.user_data.pop("review_order_id", None)
+        context.user_data.pop("review_rating", None)
+
+        await update.message.reply_text("Спасибо! Ваш отзыв сохранён 🙏")
         return
 
-    if update.message is None or update.message.text is None:
-        return
-    text = update.message.text.strip()
-    user = update.effective_user
-
-    # If review flow active, handle it first
-    if context.user_data.get('review_flow'):
-        await handle_review_flow(update, context)
-        return
-
-    # If admin is in product add/edit flow, route to handlers for text inputs
-    if context.user_data.get('product_flow'):
-        await handle_add_product_flow(update, context)
-        return
-    if context.user_data.get('edit_flow'):
-        await handle_edit_product_flow(update, context)
-        return
+        
 
     # admin command
     if text == '/admin':
         await admin_menu(update, context)
         return
 
+    # --- PUBG ID перед покупкой ---
+    if context.user_data.get('awaiting_pubg_for_order'):
+        if text in ('↩️ Назад', '/cancel'):
+            context.user_data.pop('awaiting_pubg_for_order', None)
+            context.user_data.pop('pending_buy_pid', None)
+            await update.message.reply_text('Отменено.', reply_markup=MAIN_MENU)
+            return
+
+        # сохраняем PUBG ID
+        db_execute('UPDATE users SET pubg_id=? WHERE tg_id=?', (text, user.id))
+
+        pid = context.user_data.get('pending_buy_pid')
+        product = db_execute('SELECT name, price FROM products WHERE id=?', (pid,), fetch=True)[0]
+        name, price = product
+
+        user_row = db_execute('SELECT id FROM users WHERE tg_id=?', (user.id,), fetch=True)
+        user_db_id = user_row[0][0]
+
+        # создаём заказ
+        db_execute(
+            'INSERT INTO orders (user_id, product_id, price, status, created_at, pubg_id) VALUES (?, ?, ?, ?, ?, ?)',
+            (user_db_id, pid, price, 'awaiting_screenshot', now_iso(), text)
+        )
+
+        context.user_data.pop('awaiting_pubg_for_order', None)
+        context.user_data.pop('pending_buy_pid', None)
+
+        await update.message.reply_text(
+            f'Заказ создан! {name} — {price}₽\nОтправьте скрин оплаты.',
+            reply_markup=MAIN_MENU
+        )
+        return
+
+    # кнопка каталог
     if text == '📦 Каталог':
         await products_handler(update, context)
         return
+
+    # мои заказы
     if text == '🧾 Мои заказы':
         await my_orders(update, context)
         return
+
+    # --- Привязать PUBG ID по кнопке ---
     if text == '🎮 Привязать PUBG ID':
-        await update.message.reply_text('Отправьте ваш PUBG ID (ник или цифры), или нажмите ↩️ Назад.', reply_markup=CANCEL_BUTTON)
+        context.user_data['awaiting_pubg_for_profile'] = True
+        await update.message.reply_text(
+            'Введите ваш PUBG ID:',
+            reply_markup=CANCEL_BUTTON
+        )
         return
+
+    # --- Ввод PUBG ID вручную (после кнопки) ---
+    if context.user_data.get('awaiting_pubg_for_profile'):
+        if text in ('↩️ Назад', '/cancel'):
+            context.user_data.pop('awaiting_pubg_for_profile', None)
+            await update.message.reply_text('Отменено.', reply_markup=MAIN_MENU)
+            return
+
+        db_execute('UPDATE users SET pubg_id=? WHERE tg_id=?', (text, user.id))
+        context.user_data.pop('awaiting_pubg_for_profile', None)
+
+        await update.message.reply_text(
+            f'PUBG ID сохранён: {text}',
+            reply_markup=MAIN_MENU
+        )
+        return
+
+    # нераспознанный текст
+    await update.message.reply_text(
+        'Выберите действие в меню ниже.',
+        reply_markup=MAIN_MENU
+    )
+
     if text == '📞 Поддержка':
         bot_username = context.bot.username or 'админ'
-        await update.message.reply_text('Свяжитесь с владельцем: @' + bot_username, reply_markup=MAIN_MENU)
+        await update.message.reply_text('Свяжитесь с владельцем: @' + zavik911, reply_markup=MAIN_MENU)
         return
     if text == '↩️ Назад':
         await update.message.reply_text('Вернулись в меню.', reply_markup=MAIN_MENU)
@@ -446,13 +514,6 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await list_orders_admin(update, context)
         return
 
-    # Heuristic: user sending PUBG ID
-    if text and len(text) <= 32 and ' ' not in text and text != '/start':
-        db_execute('INSERT OR IGNORE INTO users (tg_id, username, registered_at) VALUES (?, ?, ?)',
-                   (user.id, user.username or '', now_iso()))
-        db_execute('UPDATE users SET pubg_id=? WHERE tg_id=?', (text, user.id))
-        await update.message.reply_text(f'PUBG ID сохранён: {text}', reply_markup=MAIN_MENU)
-        return
 
     # Admin delete id handling
     if context.user_data.pop('awaiting_delete_id', False) and is_admin_tg(user.id):
@@ -964,50 +1025,39 @@ async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # User pressed "Купить" inline button
 async def buy_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    if query is None:
-        return
-    try:
-        await query.answer()
-    except BadRequest:
-        pass
+    await query.answer()
 
-    data = query.data or ''
-    if not data.startswith('buy:'):
-        return
-    _, pid_str = data.split(':', 1)
-    try:
-        pid = int(pid_str)
-    except ValueError:
-        return
+    pid = int(query.data.split(':')[1])
 
-    p = db_execute('SELECT id, name, price FROM products WHERE id=?', (pid,), fetch=True)
-    if not p:
-        try:
-            await query.edit_message_text('Товар не найден.')
-        except Exception:
-            pass
-        return
-    prod_id, name, price = p[0]
+    product = db_execute('SELECT name, price FROM products WHERE id=?', (pid,), fetch=True)
+    name, price = product[0]
 
     user = query.from_user
-    db_execute('INSERT OR IGNORE INTO users (tg_id, username, registered_at) VALUES (?, ?, ?)',
-               (user.id, user.username or '', now_iso()))
-    user_row = db_execute('SELECT id, pubg_id FROM users WHERE tg_id=?', (user.id,), fetch=True)
-    user_db_id = user_row[0][0]
-    pubg_id = user_row[0][1]
 
-    # create order awaiting screenshot
-    db_execute('INSERT INTO orders (user_id, product_id, price, status, created_at, pubg_id) VALUES (?, ?, ?, ?, ?, ?)',
-               (user_db_id, prod_id, price, 'awaiting_screenshot', now_iso(), pubg_id))
+    row = db_execute('SELECT id, pubg_id FROM users WHERE tg_id=?', (user.id,), fetch=True)
+    user_db_id, pubg_id = row[0] if row else (None, None)
 
-    try:
+    # Если нет PUBG ID — спросить
+    if not pubg_id:
+        context.user_data['awaiting_pubg_for_order'] = True
+        context.user_data['pending_buy_pid'] = pid
         await query.message.reply_text(
-            f'Вы выбрали: {name} — {price}₽\n\n'
-            'Оплатите заказ по номеру телефона +79002535363(сбер Николай М)Отправьте скриншот оплаты (перевод/квитанция) в этот чат.\n'
-            'Если вы не указали PUBG ID — добавьте его в сообщении.'
+            'Введите ваш PUBG ID перед оформлением заказа:',
+            reply_markup=CANCEL_BUTTON
         )
-    except Exception:
-        pass
+        return
+
+    # Если PUBG ID есть — создаём заказ
+    db_execute(
+        'INSERT INTO orders (user_id, product_id, price, status, created_at, pubg_id) VALUES (?, ?, ?, ?, ?, ?)',
+        (user_db_id, pid, price, 'awaiting_screenshot', now_iso(), pubg_id)
+    )
+
+    await query.message.reply_text(
+        f'Вы выбрали: {name} — {price}₽\n\n'
+        'Оплатите заказ по номеру телефона +79002535363 (Сбер Николай М). '
+        'После оплаты отправьте скриншот перевода в этот чат.'
+    )
 
 
 # --- Photo routing: either admin product-photo flows OR payment screenshots ---
@@ -1350,28 +1400,36 @@ async def order_progress_callback(update: Update, context: ContextTypes.DEFAULT_
         except Exception:
             logger.exception('Failed to update admin message after status change')
 
+    # Notify buyer about status change
+    buyer_tg_id = buyer_row[0][0]  # telegram id of buyer
+
     try:
-        # notify buyer about status change
-        await context.bot.send_message(chat_id=buyer_row[0][0], text=f'Статус вашего заказа #{order_id} изменён: {status_val}')
+        await context.bot.send_message(
+            chat_id=buyer_tg_id,
+            text=f'Статус вашего заказа #{order_id} изменён: {status_val}'
+        )
     except Exception:
         logger.warning('Failed to notify buyer of status change')
 
-    # If done => calculate payouts and trigger review flow
-    if new_status == 'done':
-        await calculate_and_record_payouts(order_id, context)
-        # ask buyer to leave reviews for workers
-        # fetch buyer tg_id
-        buyer_tg_id = buyer_row[0][0] if buyer_row else None
-        if buyer_tg_id:
-            # fetch workers
-            workers = db_execute('SELECT worker_id, worker_username FROM order_workers WHERE order_id=? ORDER BY id', (order_id,), fetch=True)
-            if workers:
-                # send a message with a button to start reviews
-                kb2 = InlineKeyboardMarkup([[InlineKeyboardButton('Оставить отзыв', callback_data=f'leave_review:{order_id}')]])
-                try:
-                    await context.bot.send_message(chat_id=buyer_tg_id, text=f'Ваш заказ #{order_id} выполнен. Пожалуйста, оцените исполнителей.', reply_markup=kb2)
-                except Exception:
-                    logger.warning('Failed to prompt buyer for reviews')
+    # If done — ask for review
+    if new_status == "done":
+        review_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Оставить отзыв ⭐", callback_data=f"review:{order_id}")
+        ]])
+
+    
+    
+        try:
+            await context.bot.send_message(
+                chat_id=buyer_tg_id,
+                text=f"Ваш заказ #{order_id} выполнен. Пожалуйста, оцените исполнителей.",
+                reply_markup=review_kb
+            )
+        except Exception:
+            logger.warning("Failed to prompt buyer for review")
+
+
+
 
 
 async def calculate_and_record_payouts(order_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1423,44 +1481,46 @@ async def calculate_and_record_payouts(order_id: int, context: ContextTypes.DEFA
 
 
 # Callback to open review flow (buttons)
-async def leave_review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def leave_review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if q is None:
-        return
     await q.answer()
-    data = q.data or ''
-    if not data.startswith('leave_review:'):
+
+    data = q.data.split(':')
+    if len(data) < 2:
         return
-    _, oid_str = data.split(':', 1)
-    try:
-        order_id = int(oid_str)
-    except ValueError:
-        return
-    # fetch workers for this order
-    workers = db_execute('SELECT worker_id, worker_username FROM order_workers WHERE order_id=? ORDER BY id', (order_id,), fetch=True)
-    if not workers:
-        try:
-            await q.message.reply_text('На этот заказ нет назначенных исполнителей.')
-        except Exception:
-            pass
-        return
-    # If only one worker -> ask rating directly
-    if len(workers) == 1:
-        wid, wname = workers[0]
-        context.user_data['review_flow'] = {'stage': 'awaiting_rating', 'order_id': order_id, 'worker_id': wid, 'done_workers': []}
-        try:
-            await q.message.reply_text(f'Оцените исполнителя @{wname} (1-5)', reply_markup=CANCEL_BUTTON)
-        except Exception:
-            pass
-        return
-    # multiple workers -> present inline list to choose whom to review (or do all sequentially)
-    kb_rows = []
-    for wid, wname in workers:
-        kb_rows.append([InlineKeyboardButton(text=f'@{wname}', callback_data=f'review_worker:{order_id}:{wid}')])
-    try:
-        await q.message.reply_text('Выберите исполнителя для отзыва (можно повторять для всех):', reply_markup=InlineKeyboardMarkup(kb_rows))
-    except Exception:
-        pass
+
+    order_id = int(data[1])
+    context.user_data["review_order_id"] = order_id
+
+    # Показываем выбор оценки
+    kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⭐", callback_data=f"rate:{order_id}:1"),
+            InlineKeyboardButton("⭐⭐", callback_data=f"rate:{order_id}:2"),
+            InlineKeyboardButton("⭐⭐⭐", callback_data=f"rate:{order_id}:3"),
+            InlineKeyboardButton("⭐⭐⭐⭐", callback_data=f"rate:{order_id}:4"),
+            InlineKeyboardButton("⭐⭐⭐⭐⭐", callback_data=f"rate:{order_id}:5")
+        ]
+    ])
+
+    await q.message.reply_text(
+        "Оцените исполнителей по шкале 1–5 ⭐:",
+        reply_markup=kb
+    )
+   
+async def rate_review_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+
+    _, order_id_str, rating_str = q.data.split(':')
+    order_id = int(order_id_str)
+    rating = int(rating_str)
+
+    context.user_data["review_rating"] = rating
+    context.user_data["review_order_id"] = order_id
+
+    await q.message.reply_text("Напишите текст отзыва:")
+    context.user_data["awaiting_review_text"] = True
 
 
 # callback when user selects a worker to review
@@ -1917,8 +1977,12 @@ def build_app():
     app.add_handler(CallbackQueryHandler(admin_decision, pattern=r'^(confirm:|reject:)'), group=2)
     app.add_handler(CallbackQueryHandler(performer_action, pattern=r'^(take:|leave:)'), group=2)
     app.add_handler(CallbackQueryHandler(order_progress_callback, pattern=r'^status:'), group=2)
+    app.add_handler(CallbackQueryHandler(leave_review_callback, pattern=r'^review:'), group=2)
+    app.add_handler(CallbackQueryHandler(rate_review_callback, pattern=r'^rate:'), group=2)
     app.add_handler(CallbackQueryHandler(leave_review_callback, pattern=r'^leave_review:'), group=2)
     app.add_handler(CallbackQueryHandler(review_worker_callback, pattern=r'^review_worker:'), group=2)
+
+
 
     # product edit/delete callbacks
     app.add_handler(CallbackQueryHandler(editfield_callback, pattern=r'^editfield:'), group=2)
