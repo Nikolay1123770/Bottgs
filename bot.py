@@ -1954,49 +1954,55 @@ def build_app():
     init_db()
     app = ApplicationBuilder().token(TG_BOT_TOKEN).build()
 
-    # ignore messages in admin group (keeps bot quiet there)
-    app.add_handler(MessageHandler(filters.Chat(ADMIN_CHAT_ID) & filters.ALL, ignore_admin_group), group=0)
+    # --- 1. Игнорирование группы (ставить ПЕРВЫМ!) ---
+    app.add_handler(
+        MessageHandler(filters.Chat(ADMIN_CHAT_ID) & filters.ALL, ignore_admin_group),
+        group=0
+    )
 
-    # user flows
+    # --- 2. Пользовательские команды ---
     app.add_handler(CommandHandler('start', start), group=1)
-    app.add_handler(CommandHandler('worker', worker_stats_handler), group=1)  # new
+    app.add_handler(CommandHandler('worker', worker_stats_handler), group=1)
     app.add_handler(CommandHandler('stats', bot_stats_handler), group=1)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router), group=1)
-    
 
-    # photo router (routes admin product photos -> product flows, else -> payment handler)
+    # --- 3. Основной роутер текста ---
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router), group=1)
+
+    # --- 4. Фото ---
     app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, photo_router), group=1)
 
-    # callbacks for product browsing / buy / details
+    # --- 5. Callbacks (покупки, детали, отзывы) ---
     app.add_handler(CallbackQueryHandler(buy_callback, pattern=r'^buy:'), group=1)
     app.add_handler(CallbackQueryHandler(product_detail_callback, pattern=r'^detail:'), group=1)
-    app.add_handler(CallbackQueryHandler(product_reviews_handler, pattern=r"^reviews_"))
-    CallbackQueryHandler(product_detail_callback, pattern=r"^product_")
+    app.add_handler(CallbackQueryHandler(product_reviews_handler, pattern=r'^reviews_'), group=1)
 
-    # admin / performer callbacks
+    # --- 6. Админ / исполнитель ---
     app.add_handler(CallbackQueryHandler(admin_decision, pattern=r'^(confirm:|reject:)'), group=2)
     app.add_handler(CallbackQueryHandler(performer_action, pattern=r'^(take:|leave:)'), group=2)
     app.add_handler(CallbackQueryHandler(order_progress_callback, pattern=r'^status:'), group=2)
+
+    # --- 7. Отзывы ---
     app.add_handler(CallbackQueryHandler(leave_review_callback, pattern=r'^review:'), group=2)
     app.add_handler(CallbackQueryHandler(rate_review_callback, pattern=r'^rate:'), group=2)
     app.add_handler(CallbackQueryHandler(leave_review_callback, pattern=r'^leave_review:'), group=2)
     app.add_handler(CallbackQueryHandler(review_worker_callback, pattern=r'^review_worker:'), group=2)
 
-
-
-    # product edit/delete callbacks
+    # --- 8. Редактирование товаров ---
     app.add_handler(CallbackQueryHandler(editfield_callback, pattern=r'^editfield:'), group=2)
     app.add_handler(CallbackQueryHandler(delete_callback, pattern=r'^delete:'), group=2)
-    app.add_handler(CallbackQueryHandler(edit_callback, pattern=r'^edit:'), group=2)  # opens edit flow from detail
+    app.add_handler(CallbackQueryHandler(edit_callback, pattern=r'^edit:'), group=2)
 
-    # admin flows / commands
+    # --- 9. Админ команды ---
     app.add_handler(CommandHandler('admin', admin_menu), group=1)
     app.add_handler(CommandHandler('add', add_command_handler), group=1)
     app.add_handler(CommandHandler('setphoto', setphoto_handler), group=1)
-    # legacy quick-add (kept)
+
+    # --- 10. Легаси-хендлер добавления товара ---
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_text_handler), group=1)
 
+    # --- 11. Ошибки ---
     app.add_error_handler(error_handler)
+
     return app
 
 
