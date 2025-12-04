@@ -41,7 +41,7 @@ from telegram.ext import (
 from telegram.error import BadRequest
 
 # --- Configuration ---
-TG_BOT_TOKEN = os.getenv('TG_BOT_TOKEN', '8269807126:AAFLKT39qdkKR81df5nEYuCFIk3z8kdZbSo')
+TG_BOT_TOKEN = os.getenv('TG_BOT_TOKEN', '8269807126:AAFh4LQOnoKawEXFrbA7vVBFfDXn-JB0ixQ')
 OWNER_ID = int(os.getenv('OWNER_ID', '8473513085'))
 ADMIN_CHAT_ID = int(os.getenv('ADMIN_CHAT_ID', '-1003448809517'))
 NOTIFY_CHAT_IDS = [int(x) for x in os.getenv('NOTIFY_CHAT_IDS', '-1003448809517').split(',') if x.strip()]
@@ -478,9 +478,9 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         reply_markup=MAIN_MENU
     )
 
-    if text == '📞 Поддержка':
+if text == '📞 Поддержка':
     await update.message.reply_text(
-        'Свяжитесь с владельцем: https://t.me/zavik911',
+        'Свяжитесь с владельцем: @zavik911',
         reply_markup=MAIN_MENU
     )
     return
