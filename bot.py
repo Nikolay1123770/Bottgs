@@ -374,6 +374,10 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user = update.message.from_user
     text = update.message.text
 
+    # --- бот молчит в любых группах ---
+    if update.message.chat.type in ("group", "supergroup"):
+        return
+        
     # --- обработка текста отзыва ---
     if context.user_data.get("awaiting_review_text"):
         order_id = context.user_data.get("review_order_id")
