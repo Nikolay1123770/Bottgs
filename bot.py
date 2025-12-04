@@ -476,7 +476,7 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # --- Поддержка ---
     if text == '📞 Поддержка':
         await update.message.reply_text(
-            'Свяжитесь с владельцем: @zavik911',
+            'Свяжитесь с владельцем: @wixyeez',
             reply_markup=MAIN_MENU
         )
         return
