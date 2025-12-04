@@ -479,9 +479,12 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
     if text == '📞 Поддержка':
-        bot_username = context.bot.username or 'админ'
-        await update.message.reply_text('Свяжитесь с владельцем: @' + zavik911, reply_markup=MAIN_MENU)
-        return
+    await update.message.reply_text(
+        'Свяжитесь с владельцем: https://t.me/zavik911',
+        reply_markup=MAIN_MENU
+    )
+    return
+
     if text == '↩️ Назад':
         await update.message.reply_text('Вернулись в меню.', reply_markup=MAIN_MENU)
         return
