@@ -1965,67 +1965,71 @@ def build_app():
     init_db()
     app = ApplicationBuilder().token(TG_BOT_TOKEN).build()
 
-    # --- 1. Игнорирование группы (ставить ПЕРВЫМ!) ---
+    # --- 0. Игнорирование группы (ставим ПЕРВЫМ) ---
     app.add_handler(
         MessageHandler(filters.Chat(ADMIN_CHAT_ID) & filters.ALL, ignore_admin_group),
         group=0
     )
 
-    # --- 2. Команды ---
+    # --- 1. Команды (пользовательские) ---
     app.add_handler(CommandHandler('start', start), group=1)
     app.add_handler(CommandHandler('worker', worker_stats_handler), group=1)
     app.add_handler(CommandHandler('stats', bot_stats_handler), group=1)
+
+    # --- 2. Основной роутер текста (текстовые команды/сообщения) ---
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router), group=1)
+
+    # --- 3. Фото (скриншоты, загрузки) ---
+    app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, photo_router), group=1)
+
+    # --- 4. Callbacks: покупки, детали, отзывы, каталог, листание ---
+    app.add_handler(CallbackQueryHandler(buy_callback, pattern=r'^buy:'), group=1)
+    app.add_handler(CallbackQueryHandler(product_detail_callback, pattern=r'^detail:'), group=1)
+
+    # product reviews UI
+    app.add_handler(CallbackQueryHandler(product_reviews_handler, pattern=r'^reviews_'), group=1)
+    app.add_handler(CallbackQueryHandler(product_review_addition, pattern=r'^add_review:'), group=1)
+    app.add_handler(CallbackQueryHandler(start_product_review, pattern=r'^review_product:'), group=1)
+
+    # catalog categories & navigation
+    app.add_handler(CallbackQueryHandler(catalog_category_callback, pattern=r'^cat:'), group=1)
+    app.add_handler(CallbackQueryHandler(catalog_back_callback, pattern=r'^catalog_back$'), group=1)
+    app.add_handler(CallbackQueryHandler(catalog_next_prev, pattern=r'^(cat_next|cat_prev)$'), group=1)
+
+    # --- 5. Админ / исполнители (группа 2) ---
+    app.add_handler(CallbackQueryHandler(admin_decision, pattern=r'^(confirm:|reject:)'), group=2)
+    app.add_handler(CallbackQueryHandler(performer_action, pattern=r'^(take:|leave:)'), group=2)
+    app.add_handler(CallbackQueryHandler(order_progress_callback, pattern=r'^status:'), group=2)
+
+    # --- 6. Отзывы (по заказам — отдельный flow) ---
+    app.add_handler(CallbackQueryHandler(leave_review_callback, pattern=r'^review:'), group=2)
+    app.add_handler(CallbackQueryHandler(rate_review_callback, pattern=r'^rate:'), group=2)
+    app.add_handler(CallbackQueryHandler(review_worker_callback, pattern=r'^review_worker:'), group=2)
+
+    # --- 7. Редактирование товаров (админ) ---
+    app.add_handler(CallbackQueryHandler(editfield_callback, pattern=r'^editfield:'), group=2)
+    app.add_handler(CallbackQueryHandler(delete_callback, pattern=r'^delete:'), group=2)
+    app.add_handler(CallbackQueryHandler(edit_callback, pattern=r'^edit:'), group=2)
+
+    # --- 8. Админские команды ---
     app.add_handler(CommandHandler('admin', admin_menu), group=1)
     app.add_handler(CommandHandler('add', add_command_handler), group=1)
     app.add_handler(CommandHandler('setphoto', setphoto_handler), group=1)
 
-    # --- 3. ОБРАБОТЧИК сообщений от пользователя ---
-    # (обычный текст — меню, каталог, ответы)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router), group=2)
+    # --- 9. Legacy / fallback добавления товара (если используете) ---
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_text_handler), group=1)
 
-    # --- 4. Фото ---
-    app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, photo_router), group=2)
-
-    # --- 5. CALLBACKS (покупки, детали, каталог) ---
-    app.add_handler(CallbackQueryHandler(buy_callback, pattern=r'^buy:'), group=2)
-    app.add_handler(CallbackQueryHandler(product_detail_callback, pattern=r'^detail:'), group=2)
-
-    # Каталог
-    app.add_handler(CallbackQueryHandler(catalog_category_callback, pattern=r'^cat:'), group=2)
-    app.add_handler(CallbackQueryHandler(catalog_back_callback, pattern=r'^catalog_back$'), group=2)
-    app.add_handler(CallbackQueryHandler(catalog_next_prev, pattern=r'^cat_next$'), group=2)
-    app.add_handler(CallbackQueryHandler(catalog_next_prev, pattern=r'^cat_prev$'), group=2)
-
-    # --- 6. ОТЗЫВЫ НА ТОВАР ---
-    app.add_handler(CallbackQueryHandler(product_reviews_handler, pattern=r'^reviews_'), group=2)
-    app.add_handler(CallbackQueryHandler(start_product_review, pattern=r'^review_product:'), group=2)
-    app.add_handler(CallbackQueryHandler(product_review_addition, pattern=r'^add_review:'), group=2)
-
-    # ОБРАБОТКА ТЕКСТА КОГДА ПОЛЬЗОВАТЕЛЬ ПИШЕТ ОТЗЫВ
+    # --- 10. Текстовый поток для добавления отзывов о товаре (awaiting flow) ---
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, product_review_message), group=1)
 
-    # --- 7. Админ / Исполнители ---
-    app.add_handler(CallbackQueryHandler(admin_decision, pattern=r'^(confirm:|reject:)'), group=3)
-    app.add_handler(CallbackQueryHandler(performer_action, pattern=r'^(take:|leave:)'), group=3)
-    app.add_handler(CallbackQueryHandler(order_progress_callback, pattern=r'^status:'), group=3)
-
-    # --- 8. Отзывы на работника ---
-    app.add_handler(CallbackQueryHandler(leave_review_callback, pattern=r'^review:'), group=3)
-    app.add_handler(CallbackQueryHandler(rate_review_callback, pattern=r'^rate:'), group=3)
-    app.add_handler(CallbackQueryHandler(leave_review_callback, pattern=r'^leave_review:'), group=3)
-    app.add_handler(CallbackQueryHandler(review_worker_callback, pattern=r'^review_worker:'), group=3)
-
-    # --- 9. ДОБАВЛЕНИЕ ТОВАРА (админ текст) ---
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_text_handler), group=4)
-
-    # --- 10. Ошибки ---
+    # --- 11. Глобальный обработчик ошибок ---
     app.add_error_handler(error_handler)
 
     return app
 
 
-
 if __name__ == "__main__":
+    # инициализация БД и запуск
     init_db()
     application = build_app()
     application.run_polling()
