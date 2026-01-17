@@ -44,7 +44,7 @@ TG_BOT_TOKEN = os.getenv('TG_BOT_TOKEN', '8269807126:AAFLKT39qdkKR81df5nEYuCFIk3
 OWNER_ID = int(os.getenv('OWNER_ID', '8473513085'))
 ADMIN_CHAT_ID = int(os.getenv('ADMIN_CHAT_ID', '-1003448809517'))
 DB_PATH = os.getenv('DB_PATH', 'metro_shop.db')
-SUPPORT_CONTACT_USER = os.getenv('SUPPORT_CONTACT', '@YourAdminUsername')
+SUPPORT_CONTACT_USER = os.getenv('SUPPORT_CONTACT', '@Wixyeez')
 
 # --- LAVA.TOP CONFIG ---
 LAVA_SECRET_KEY = os.getenv('LAVA_SECRET_KEY', '5xRSR1dnermm7LYtMRICZclNxuEAteScAKXuWSuOdebuZvUoPnOTu12DgKYrcVvI')
